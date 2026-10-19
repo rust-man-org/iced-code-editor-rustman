@@ -27,6 +27,8 @@ pub struct Style {
     /// If `None`, the editor auto-selects based on background brightness.
     /// Set this to override the default (e.g. "base16-mocha.dark", "InspiredGitHub").
     pub syntax_theme_name: Option<&'static str>,
+    /// Foreground color for JSON object property names.
+    pub json_key_color: Color,
 }
 
 /// The theme catalog of a code editor.
@@ -155,6 +157,7 @@ pub fn from_iced_theme(theme: &iced::Theme) -> Style {
         whitespace_color,
         selection_color,
         syntax_theme_name: None,
+        json_key_color: palette.primary.base.color,
     }
 }
 

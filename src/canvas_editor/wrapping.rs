@@ -11,6 +11,8 @@ use std::ops::Range;
 
 use super::compare_floats;
 
+const WRAP_WIDTH_PADDING_PIXELS: f32 = 25.0;
+
 /// Represents a visual line segment in the editor.
 ///
 /// When line wrapping is enabled, a single logical line may be split into
@@ -160,7 +162,7 @@ impl WrappingCalculator {
         let wrap_width_pixels = if let Some(cols) = self.wrap_column {
             cols as f32 * self.char_width
         } else {
-            (viewport_width - gutter_width).max(self.char_width)
+            (viewport_width - gutter_width - WRAP_WIDTH_PADDING_PIXELS).max(self.char_width)
         };
 
         let mut visual_lines = Vec::new();

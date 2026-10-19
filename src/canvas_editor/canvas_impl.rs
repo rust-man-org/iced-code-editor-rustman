@@ -156,6 +156,15 @@ fn color_from_style(style: Style) -> Color {
     )
 }
 
+/// Character offset just after the quoted key in a JSON object property.
+fn json_key_end(line: &str) -> Option<usize> {
+    let closing_quote = line.find("\":")?;
+    if !line[..closing_quote].trim_start().starts_with('"') {
+        return None;
+    }
+    Some(line[..=closing_quote].chars().count())
+}
+
 /// Perceptual luminance (ITU-R BT.601), used only to compare contrast.
 fn luminance(color: Color) -> f32 {
     color.r * 0.299 + color.g * 0.587 + color.b * 0.114
@@ -667,6 +676,11 @@ impl CodeEditor {
             let mut x_offset =
                 ctx.gutter_width + 5.0 - ctx.horizontal_scroll_offset;
             let mut char_pos = 0;
+            let json_key_end = if self.syntax == "json" {
+                json_key_end(self.buffer.line(visual_line.logical_line))
+            } else {
+                None
+            };
 
             for (color, text) in spans.iter() {
                 let text_len = text.chars().count();
@@ -692,6 +706,13 @@ impl CodeEditor {
                     );
 
                     let segment_text = &text[start_byte..end_byte];
+                    let token_color = if json_key_end
+                        .is_some_and(|key_end| segment_start < key_end)
+                    {
+                        self.style.json_key_color
+                    } else {
+                        *color
+                    };
                     let display_text = if self.show_whitespace {
                         expand_tabs_visible(segment_text, super::TAB_WIDTH)
                     } else {
@@ -709,8 +730,7 @@ impl CodeEditor {
                         for (is_ws, seg) in
                             split_whitespace_segments(&display_text)
                         {
-                            let seg_color =
-                                if is_ws { ws_color } else { *color };
+                            let seg_color = if is_ws { ws_color } else { token_color };
                             let seg_width = measure_text_width(
                                 seg,
                                 ctx.full_char_width,
@@ -730,7 +750,7 @@ impl CodeEditor {
                         frame.fill_text(canvas::Text {
                             content: display_text,
                             position: Point::new(x_offset, y + 2.0),
-                            color: *color,
+                            color: token_color,
                             size: ctx.font_size.into(),
                             font: ctx.font,
                             ..canvas::Text::default()
@@ -3749,6 +3769,7 @@ mod tests {
             current_line_highlight: Color::from_rgba(1.0, 1.0, 1.0, 0.1),
             whitespace_color: Color::from_rgba(1.0, 1.0, 1.0, 0.4),
             selection_color: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
+            json_key_color: Color::from_rgb(0.7, 0.5, 0.9),
             syntax_theme_name: Some("base16-mocha.dark"),
         };
         editor.set_theme(style);
