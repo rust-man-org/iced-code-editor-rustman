@@ -1,0 +1,6 @@
+[env]
+# The editor keeps a process-global focused-editor id (FOCUSED_EDITOR_ID), so
+# tests that request focus can steal it from other tests running in parallel.
+# When that happens, CharacterInput is ignored and a test sees an unchanged
+# buffer. Serialize the test binary instead of chasing intermittent failures.
+RUST_TEST_THREADS = "1"
