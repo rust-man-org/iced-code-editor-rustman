@@ -27,8 +27,51 @@ pub struct Style {
     /// If `None`, the editor auto-selects based on background brightness.
     /// Set this to override the default (e.g. "base16-mocha.dark", "InspiredGitHub").
     pub syntax_theme_name: Option<&'static str>,
-    /// Foreground color for JSON object property names.
+    /// Foreground color for JSON object property names, and the default
+    /// [`TokenColors::key`].
     pub json_key_color: Color,
+    /// Scope-based token colors drawn over the syntax theme. `None` keeps the
+    /// theme's colors, with only JSON keys drawn in `json_key_color`.
+    pub token_colors: Option<TokenColors>,
+}
+
+/// Colors that replace the syntax theme's for common token kinds.
+///
+/// They are matched by TextMate scope, so they apply to every grammar using
+/// the usual scope names (JSON, YAML, JavaScript, ...). A `None` field keeps
+/// the theme's color, except `key`, which falls back to
+/// [`Style::json_key_color`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TokenColors {
+    /// Object keys and property names.
+    pub key: Option<Color>,
+    /// Strings, quotes included.
+    pub string: Option<Color>,
+    /// Numbers (`constant.numeric`).
+    pub number: Option<Color>,
+    /// `true`, `false`, `null` and other `constant.language` values.
+    pub literal: Option<Color>,
+    /// Brackets, separators and other structural punctuation.
+    pub punctuation: Option<Color>,
+}
+
+impl Style {
+    /// Whether text highlighted under `self` keeps its colors under `other`.
+    pub(crate) fn highlights_like(&self, other: &Self) -> bool {
+        self.background == other.background
+            && self.text_color == other.text_color
+            && self.syntax_theme_name == other.syntax_theme_name
+            && self.json_key_color == other.json_key_color
+            && self.token_colors == other.token_colors
+    }
+
+    /// Returns the token colors with `key` resolved, if any are set.
+    pub(crate) fn resolved_token_colors(&self) -> Option<TokenColors> {
+        self.token_colors.map(|colors| TokenColors {
+            key: colors.key.or(Some(self.json_key_color)),
+            ..colors
+        })
+    }
 }
 
 /// The theme catalog of a code editor.
@@ -158,6 +201,7 @@ pub fn from_iced_theme(theme: &iced::Theme) -> Style {
         selection_color,
         syntax_theme_name: None,
         json_key_color: palette.primary.base.color,
+        token_colors: None,
     }
 }
 

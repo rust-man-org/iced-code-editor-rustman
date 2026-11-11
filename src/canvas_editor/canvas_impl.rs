@@ -16,9 +16,11 @@ use std::time::Instant;
 use web_time::Instant;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{
-    HighlightIterator, HighlightState, Highlighter, Style, ThemeSet,
+    HighlightState, Highlighter, RangedHighlightIterator, Style, ThemeSet,
 };
-use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
+use syntect::parsing::{
+    ParseState, Scope, ScopeStack, ScopeStackOp, SyntaxSet,
+};
 
 /// Computes geometry (x start and width) for a text segment used in rendering or highlighting.
 ///
@@ -165,6 +167,95 @@ fn json_key_end(line: &str) -> Option<usize> {
     Some(line[..=closing_quote].chars().count())
 }
 
+/// Scope prefixes that select each [`TokenColors`] kind.
+struct TokenScopes {
+    key: Vec<Scope>,
+    string: Scope,
+    number: Scope,
+    literal: Scope,
+    punctuation: Scope,
+    delimiter: Scope,
+    meta: Scope,
+}
+
+impl TokenScopes {
+    fn get() -> Option<&'static Self> {
+        static SCOPES: OnceLock<Option<TokenScopes>> = OnceLock::new();
+        SCOPES.get_or_init(Self::parse).as_ref()
+    }
+
+    fn parse() -> Option<Self> {
+        let scope = |name: &str| Scope::new(name).ok();
+        let scopes = |names: &[&str]| -> Option<Vec<Scope>> {
+            names.iter().map(|name| scope(name)).collect()
+        };
+        Some(Self {
+            key: scopes(&[
+                "meta.mapping.key",
+                "meta.structure.dictionary.key",
+                "meta.object-literal.key",
+                "support.type.property-name",
+                "entity.name.tag.yaml",
+            ])?,
+            string: scope("string")?,
+            number: scope("constant.numeric")?,
+            literal: scope("constant.language")?,
+            punctuation: scope("punctuation")?,
+            delimiter: scope("punctuation.definition")?,
+            meta: scope("meta")?,
+        })
+    }
+
+    /// Returns the override for a token whose scope stack (outermost first)
+    /// is `stack`, or `None` to keep the theme's color.
+    fn color(&self, colors: &TokenColors, stack: &[Scope]) -> Option<Color> {
+        let is_key =
+            |scope: &Scope| self.key.iter().any(|key| key.is_prefix_of(*scope));
+        if stack.iter().any(is_key) {
+            return colors.key;
+        }
+        // The innermost scope naming a token decides: meta scopes only group,
+        // and quotes and other delimiters take the color of what they enclose.
+        let token = stack.iter().rev().find(|scope| {
+            !self.meta.is_prefix_of(**scope)
+                && !self.delimiter.is_prefix_of(**scope)
+        })?;
+        [
+            (self.string, colors.string),
+            (self.number, colors.number),
+            (self.literal, colors.literal),
+            (self.punctuation, colors.punctuation),
+        ]
+        .into_iter()
+        .find(|(prefix, _)| prefix.is_prefix_of(*token))
+        .and_then(|(_, color)| color)
+    }
+}
+
+/// Replays a line's scope operations next to the highlighter, so each
+/// highlighted range can be matched against [`TokenColors`].
+struct ScopeTracker<'a> {
+    stack: ScopeStack,
+    ops: std::iter::Peekable<std::slice::Iter<'a, (usize, ScopeStackOp)>>,
+}
+
+impl<'a> ScopeTracker<'a> {
+    fn new(stack: ScopeStack, ops: &'a [(usize, ScopeStackOp)]) -> Self {
+        Self { stack, ops: ops.iter().peekable() }
+    }
+
+    /// Returns the scopes in effect at byte `offset`. Offsets must not
+    /// decrease between calls.
+    fn scopes_at(&mut self, offset: usize) -> &[Scope] {
+        while let Some((_, op)) =
+            self.ops.next_if(|(position, _)| *position <= offset)
+        {
+            let _ = self.stack.apply(op);
+        }
+        self.stack.as_slice()
+    }
+}
+
 /// Perceptual luminance (ITU-R BT.601), used only to compare contrast.
 fn luminance(color: Color) -> f32 {
     color.r * 0.299 + color.g * 0.587 + color.b * 0.114
@@ -274,11 +365,13 @@ pub fn highlight_line_spans(
         .collect()
 }
 
-use super::folding;
+use super::folding::{self, FoldMarkers};
 use super::wrapping::{VisualLine, WrappingCalculator};
 use super::{
-    ArrowDirection, CodeEditor, Message, measure_char_width, measure_text_width,
+    ArrowDirection, CodeEditor, GutterColumns, GutterLayout, Message,
+    measure_char_width, measure_text_width,
 };
+use crate::theme::TokenColors;
 use iced::widget::canvas::Action;
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
@@ -325,12 +418,20 @@ impl CodeEditor {
         visual_line: &VisualLine,
         y: f32,
     ) {
-        // The line-number area is the left part of the gutter; the fold margin
-        // (when folding is enabled) is the right strip adjacent to the text.
-        let number_area_width = self.line_number_gutter_width();
+        let GutterColumns { line_numbers, fold_markers } =
+            self.gutter_columns();
 
         if self.line_numbers_enabled {
-            if visual_line.is_first_segment() {
+            if let Some(layout) = self.gutter_layout {
+                self.draw_aligned_line_number(
+                    frame,
+                    ctx,
+                    visual_line,
+                    y,
+                    line_numbers.end,
+                    layout,
+                );
+            } else if visual_line.is_first_segment() {
                 // Draw line number for first segment, centered in the number area.
                 let line_num = visual_line.logical_line + 1;
                 let line_num_text = format!("{}", line_num);
@@ -339,7 +440,9 @@ impl CodeEditor {
                     ctx.full_char_width,
                     ctx.char_width,
                 );
-                let x_pos = (number_area_width - text_width) / 2.0;
+                let column_width = line_numbers.end - line_numbers.start;
+                let x_pos =
+                    line_numbers.start + (column_width - text_width) / 2.0;
                 frame.fill_text(canvas::Text {
                     content: line_num_text,
                     position: Point::new(x_pos, y + 2.0),
@@ -352,7 +455,7 @@ impl CodeEditor {
                 // Draw wrap indicator for continuation lines.
                 frame.fill_text(canvas::Text {
                     content: "↪".to_string(),
-                    position: Point::new(number_area_width - 20.0, y + 2.0),
+                    position: Point::new(line_numbers.end - 20.0, y + 2.0),
                     color: self.style.line_number_color,
                     size: ctx.font_size.into(),
                     font: ctx.font,
@@ -361,13 +464,55 @@ impl CodeEditor {
             }
         }
 
-        self.draw_fold_chevron(frame, ctx, visual_line, y, number_area_width);
+        self.draw_fold_chevron(frame, ctx, visual_line, y, fold_markers.start);
     }
 
-    /// Draws the fold chevron in the fold margin for a foldable header line.
+    /// Draws a line number, or the wrap indicator, right-aligned for a custom
+    /// [`GutterLayout`] whose number column ends at `column_end`.
+    fn draw_aligned_line_number(
+        &self,
+        frame: &mut canvas::Frame,
+        ctx: &RenderContext,
+        visual_line: &VisualLine,
+        y: f32,
+        column_end: f32,
+        layout: GutterLayout,
+    ) {
+        let content = if visual_line.is_first_segment() {
+            (visual_line.logical_line + 1).to_string()
+        } else {
+            "↪".to_string()
+        };
+        // Moving the top down by the size difference keeps smaller numbers
+        // on the code text's baseline.
+        let top = y + 2.0 + (ctx.font_size - layout.number_size);
+        frame.fill_text(canvas::Text {
+            content,
+            position: Point::new(column_end - layout.number_right_padding, top),
+            color: self.style.line_number_color,
+            size: layout.number_size.into(),
+            font: ctx.font,
+            align_x: iced::advanced::text::Alignment::Right,
+            ..canvas::Text::default()
+        });
+    }
+
+    /// Returns whether `visual_line` shows a fold marker.
     ///
-    /// Draws nothing when folding is disabled, on continuation (wrapped)
-    /// segments, or on lines that are not fold headers.
+    /// Drawing and hit-testing both use this, so a hidden marker is never a
+    /// click target.
+    fn shows_fold_marker(&self, visual_line: &VisualLine) -> bool {
+        let line = visual_line.logical_line;
+        self.folding_enabled
+            && visual_line.is_first_segment()
+            && self
+                .fold_markers
+                .is_visible(self.is_folded(line), self.gutter_hovered.get())
+            && folding::is_line_fold_header(&self.buffer, line)
+    }
+
+    /// Draws the fold chevron of a foldable header line, if its marker is
+    /// shown (see [`Self::shows_fold_marker`]).
     ///
     /// # Arguments
     ///
@@ -375,21 +520,16 @@ impl CodeEditor {
     /// * `ctx` - Rendering context containing metrics
     /// * `visual_line` - The visual line to render
     /// * `y` - Y position for rendering
-    /// * `number_area_width` - Width of the line-number area (start of the fold margin)
+    /// * `x` - Start of the fold-marker column
     fn draw_fold_chevron(
         &self,
         frame: &mut canvas::Frame,
         ctx: &RenderContext,
         visual_line: &VisualLine,
         y: f32,
-        number_area_width: f32,
+        x: f32,
     ) {
-        if !self.folding_enabled || !visual_line.is_first_segment() {
-            return;
-        }
-
-        if !folding::is_line_fold_header(&self.buffer, visual_line.logical_line)
-        {
+        if !self.shows_fold_marker(visual_line) {
             return;
         }
 
@@ -401,7 +541,7 @@ impl CodeEditor {
         };
         frame.fill_text(canvas::Text {
             content: chevron.to_string(),
-            position: Point::new(number_area_width + 1.0, y + 2.0),
+            position: Point::new(x + 1.0, y + 2.0),
             color: self.style.line_number_color,
             size: ctx.font_size.into(),
             font: ctx.font,
@@ -435,7 +575,7 @@ impl CodeEditor {
             ctx.full_char_width,
             ctx.char_width,
         );
-        let x = ctx.gutter_width + 5.0 - ctx.horizontal_scroll_offset
+        let x = self.text_start_x() - ctx.horizontal_scroll_offset
             + line_width
             + 6.0;
         frame.fill_text(canvas::Text {
@@ -529,6 +669,8 @@ impl CodeEditor {
         // Extend the valid prefix sequentially up to `logical_line`, carrying
         // the parser/highlight state forward across lines.
         let highlighter = Highlighter::new(theme);
+        let overrides =
+            self.style.resolved_token_colors().zip(TokenScopes::get());
         let (mut parse_state, mut highlight_state) =
             cache.resume_state().unwrap_or_else(|| {
                 (
@@ -575,27 +717,40 @@ impl CodeEditor {
                 let ops = parse_state
                     .parse_line(&line, syntax_set)
                     .unwrap_or_default();
-                let spans: Vec<(Color, String)> = HighlightIterator::new(
+                let mut scopes = overrides.map(|_| {
+                    ScopeTracker::new(highlight_state.path.clone(), &ops)
+                });
+                let spans: Vec<(Color, String)> = RangedHighlightIterator::new(
                     &mut highlight_state,
                     &ops,
                     &line,
                     &highlighter,
                 )
-                .filter_map(|(style, text)| {
+                .filter_map(|(style, text, range)| {
                     let text = text.strip_suffix('\n').unwrap_or(text);
                     if text.is_empty() {
                         None
                     } else {
+                        let token_color = overrides
+                            .zip(scopes.as_mut())
+                            .and_then(|((colors, kinds), scopes)| {
+                                kinds.color(
+                                    &colors,
+                                    scopes.scopes_at(range.start),
+                                )
+                            });
                         // Must be contrast-checked: themes encode "invalid"
                         // scopes as a background highlight with the foreground
                         // knocked out to the theme background, which would
                         // render as invisible text on this editor's background.
                         Some((
-                            readable_color_from_style(
-                                style,
-                                self.style.background,
-                                self.style.text_color,
-                            ),
+                            token_color.unwrap_or_else(|| {
+                                readable_color_from_style(
+                                    style,
+                                    self.style.background,
+                                    self.style.text_color,
+                                )
+                            }),
                             text.to_string(),
                         ))
                     }
@@ -674,13 +829,14 @@ impl CodeEditor {
             );
 
             let mut x_offset =
-                ctx.gutter_width + 5.0 - ctx.horizontal_scroll_offset;
+                self.text_start_x() - ctx.horizontal_scroll_offset;
             let mut char_pos = 0;
-            let json_key_end = if self.syntax == "json" {
-                json_key_end(self.buffer.line(visual_line.logical_line))
-            } else {
-                None
-            };
+            let json_key_end =
+                if self.style.token_colors.is_none() && self.syntax == "json" {
+                    json_key_end(self.buffer.line(visual_line.logical_line))
+                } else {
+                    None
+                };
 
             for (color, text) in spans.iter() {
                 let text_len = text.chars().count();
@@ -776,7 +932,7 @@ impl CodeEditor {
             } else {
                 expand_tabs(line_segment, super::TAB_WIDTH).into_owned()
             };
-            let base_x = ctx.gutter_width + 5.0 - ctx.horizontal_scroll_offset;
+            let base_x = self.text_start_x() - ctx.horizontal_scroll_offset;
             if self.show_whitespace {
                 let ws_color = self.style.whitespace_color;
                 let text_color = self.style.text_color;
@@ -835,14 +991,14 @@ impl CodeEditor {
         cols: (usize, usize),
         color: Color,
     ) {
-        let y = visual_idx as f32 * ctx.line_height;
+        let y = self.line_top(visual_idx);
         let line_content = self.buffer.line(vl.logical_line);
         let (x_start, width) = calculate_segment_geometry(
             line_content,
             vl.start_col,
             cols.0,
             cols.1,
-            ctx.gutter_width + 5.0,
+            self.text_start_x(),
             ctx.full_char_width,
             ctx.char_width,
         );
@@ -1005,7 +1161,7 @@ impl CodeEditor {
         } else {
             ctx.line_height * 64.0
         };
-        let first = (self.viewport_scroll / self.line_height).floor() as usize;
+        let first = self.first_visible_index(self.viewport_scroll);
         let count = (effective_height / self.line_height).ceil() as usize + 2;
         (first.min(total), (first + count).min(total))
     }
@@ -1211,12 +1367,12 @@ impl CodeEditor {
                     vl.start_col,
                     self.cursors.primary_position().1,
                     self.cursors.primary_position().1,
-                    ctx.gutter_width + 5.0,
+                    self.text_start_x(),
                     ctx.full_char_width,
                     ctx.char_width,
                 );
                 let cursor_x = cursor_x_content - ctx.horizontal_scroll_offset;
-                let cursor_y = cursor_visual as f32 * ctx.line_height;
+                let cursor_y = self.line_top(cursor_visual);
 
                 if let Some(preedit) = self.ime_preedit.as_ref() {
                     let preedit_width = measure_text_width(
@@ -1390,12 +1546,12 @@ impl CodeEditor {
                 vl.start_col,
                 position.1,
                 position.1,
-                ctx.gutter_width + 5.0,
+                self.text_start_x(),
                 ctx.full_char_width,
                 ctx.char_width,
             );
             let cursor_x = cursor_x_content - ctx.horizontal_scroll_offset;
-            let cursor_y = cursor_visual as f32 * ctx.line_height;
+            let cursor_y = self.line_top(cursor_visual);
 
             let cursor_size = self.cursor_size_for_position(position);
             let mut cursor_color = self.style.text_color;
@@ -1954,6 +2110,41 @@ impl CodeEditor {
         self.handle_character_input(key, modifiers, text_str)
     }
 
+    /// Returns the logical line of the fold header whose chevron is at `point`,
+    /// if any.
+    ///
+    /// Returns `None` when the point is outside the fold-marker column or the
+    /// targeted line shows no marker.
+    ///
+    /// # Arguments
+    ///
+    /// * `point` - The click position in canvas coordinates
+    pub(crate) fn fold_header_at_point(&self, point: Point) -> Option<usize> {
+        if !self.gutter_columns().fold_markers.contains(&point.x) {
+            return None;
+        }
+
+        let visual_line_idx = self.visual_index_at(point.y)?;
+        let visual_lines = self.visual_lines_cached(self.viewport_width);
+        let visual_line = visual_lines.get(visual_line_idx)?;
+        self.shows_fold_marker(visual_line).then_some(visual_line.logical_line)
+    }
+
+    /// Records whether the pointer (canvas-relative) is over the gutter.
+    ///
+    /// Returns `true` when that changes which fold markers are shown, after
+    /// invalidating the content layer they are drawn in.
+    fn update_gutter_hover(&self, position: Option<Point>) -> bool {
+        let hovered = position.is_some_and(|p| p.x < self.gutter_width());
+        if self.gutter_hovered.replace(hovered) == hovered
+            || self.fold_markers != FoldMarkers::OnGutterHover
+        {
+            return false;
+        }
+        self.content_cache.clear();
+        true
+    }
+
     /// Handles mouse events (button presses, movement, releases).
     ///
     /// # Arguments
@@ -1966,37 +2157,6 @@ impl CodeEditor {
     ///
     /// `Some(Action<Message>)` if the event was handled, `None` otherwise
     #[allow(clippy::unused_self)]
-    /// Returns the logical line of the fold header whose chevron is at `point`,
-    /// if any.
-    ///
-    /// Returns `None` when folding is disabled, when the point is outside the
-    /// fold margin, or when the targeted line is not a fold header.
-    ///
-    /// # Arguments
-    ///
-    /// * `point` - The click position in canvas coordinates
-    pub(crate) fn fold_header_at_point(&self, point: Point) -> Option<usize> {
-        if !self.folding_enabled {
-            return None;
-        }
-
-        // The fold margin is the strip between the line-number area and the text.
-        let margin_start = self.line_number_gutter_width();
-        if point.x < margin_start || point.x >= self.gutter_width() {
-            return None;
-        }
-
-        let visual_line_idx = (point.y / self.line_height) as usize;
-        let visual_lines = self.visual_lines_cached(self.viewport_width);
-        let visual_line = visual_lines.get(visual_line_idx)?;
-        if !visual_line.is_first_segment() {
-            return None;
-        }
-
-        folding::is_line_fold_header(&self.buffer, visual_line.logical_line)
-            .then_some(visual_line.logical_line)
-    }
-
     fn handle_mouse_event(
         &self,
         event: &mouse::Event,
@@ -2058,6 +2218,11 @@ impl CodeEditor {
                         return Action::publish(message).and_capture();
                     }
 
+                    // Shift is checked after Ctrl/Alt so Ctrl+Shift+Click
+                    // stays a jump and Alt+Shift+Click stays a cursor add.
+                    // Rapid repeats still classify as double/triple clicks
+                    // (word/line selection), exactly as without Shift.
+                    let shift = self.modifiers.get().shift();
                     let click_count = self.classify_click(position);
                     match click_count {
                         2 => Action::publish(Message::DoubleClick(position))
@@ -2066,6 +2231,9 @@ impl CodeEditor {
                             .and_capture(),
                         // Don't capture the event so it can bubble up for focus management
                         // This implements focus event propagation through the widget hierarchy
+                        _ if shift => {
+                            Action::publish(Message::ShiftClick(position))
+                        }
                         _ => Action::publish(Message::MouseClick(position)),
                     }
                 })
@@ -2077,6 +2245,9 @@ impl CodeEditor {
                 })
             }
             mouse::Event::CursorMoved { .. } => {
+                let position = cursor.position_in(bounds);
+                let markers_changed = self.update_gutter_hover(position);
+
                 // While dragging, the pointer must be tracked even once it
                 // leaves the editor's bounds.
                 //
@@ -2092,21 +2263,30 @@ impl CodeEditor {
                 // an overshoot select to the nearest edge, which is what every
                 // other text widget does.
                 if self.is_dragging {
-                    let position = cursor.position().map(|absolute| {
-                        Point::new(
-                            (absolute.x - bounds.x).clamp(0.0, bounds.width),
-                            (absolute.y - bounds.y).clamp(0.0, bounds.height),
-                        )
-                    })?;
+                    let Some(absolute) = cursor.position() else {
+                        return markers_changed.then(Action::request_redraw);
+                    };
+                    let position = Point::new(
+                        (absolute.x - bounds.x).clamp(0.0, bounds.width),
+                        (absolute.y - bounds.y).clamp(0.0, bounds.height),
+                    );
                     return Some(
                         Action::publish(Message::MouseDrag(position))
                             .and_capture(),
                     );
                 }
                 // Hover (for LSP) is only meaningful over the editor itself.
-                cursor.position_in(bounds).map(|position| {
-                    Action::publish(Message::MouseHover(position))
-                })
+                // Publishing redraws, so only leaving the editor needs an
+                // explicit redraw for the fold markers.
+                match position {
+                    Some(position) => {
+                        Some(Action::publish(Message::MouseHover(position)))
+                    }
+                    None => markers_changed.then(Action::request_redraw),
+                }
+            }
+            mouse::Event::CursorLeft => {
+                self.update_gutter_hover(None).then(Action::request_redraw)
             }
             mouse::Event::ButtonReleased(mouse::Button::Left) => {
                 // A drag must be ended wherever the button is released.
@@ -2244,13 +2424,12 @@ impl CodeEditor {
                             visual_line.start_col,
                             seg_start,
                             seg_end,
-                            ctx.gutter_width + 5.0
-                                - ctx.horizontal_scroll_offset,
+                            self.text_start_x() - ctx.horizontal_scroll_offset,
                             ctx.full_char_width,
                             ctx.char_width,
                         );
 
-                        let y = idx as f32 * ctx.line_height + ctx.line_height; // Underline at bottom
+                        let y = self.line_top(idx) + ctx.line_height; // Underline at bottom
 
                         // Draw underline
                         let path = canvas::Path::line(
@@ -2321,8 +2500,7 @@ impl canvas::Program<Message> for CodeEditor {
         } else {
             bounds.height
         };
-        let first_visible_line =
-            (self.viewport_scroll / self.line_height).floor() as usize;
+        let first_visible_line = self.first_visible_index(self.viewport_scroll);
         let visible_lines_count =
             (effective_viewport_height / self.line_height).ceil() as usize + 2;
         let last_visible_line =
@@ -2431,7 +2609,7 @@ impl canvas::Program<Message> for CodeEditor {
                         .skip(start_idx)
                         .take(end_idx.saturating_sub(start_idx))
                     {
-                        let y = idx as f32 * self.line_height;
+                        let y = self.line_top(idx);
                         self.draw_text_with_syntax_highlighting(
                             f,
                             &ctx,
@@ -2457,7 +2635,7 @@ impl canvas::Program<Message> for CodeEditor {
                     .skip(start_idx)
                     .take(end_idx.saturating_sub(start_idx))
                 {
-                    let y = idx as f32 * self.line_height;
+                    let y = self.line_top(idx);
                     self.draw_line_numbers(frame, &ctx, visual_line, y);
                 }
             });
@@ -2485,7 +2663,7 @@ impl canvas::Program<Message> for CodeEditor {
                     .skip(start_idx)
                     .take(end_idx.saturating_sub(start_idx))
                 {
-                    let y = idx as f32 * self.line_height;
+                    let y = self.line_top(idx);
                     self.draw_current_line_highlight(
                         frame,
                         &ctx,
@@ -2637,8 +2815,12 @@ fn validate_selection_indices(
 
 #[cfg(test)]
 mod tests {
+    use super::folding::FoldMarkerPosition;
     use super::*;
-    use crate::canvas_editor::{CHAR_WIDTH, FONT_SIZE, compare_floats};
+    use crate::canvas_editor::{
+        CHAR_WIDTH, FOLD_MARGIN_WIDTH, FONT_SIZE, GUTTER_WIDTH, compare_floats,
+    };
+    use iced::window::RedrawRequest;
     use std::cmp::Ordering;
 
     fn editor_mouse_interaction(
@@ -3082,6 +3264,136 @@ mod tests {
             editor.has_focus(),
             "clicking back into the editor must restore keyboard focus"
         );
+    }
+
+    /// Presses the left button at `position` with `modifiers` held. The
+    /// modifier state goes through the same `ModifiersChanged` event the
+    /// runtime sends. Returns the published message and the event status.
+    fn press_with_modifiers(
+        editor: &CodeEditor,
+        position: Point,
+        modifiers: keyboard::Modifiers,
+    ) -> (Option<Message>, iced::event::Status) {
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(400.0, 300.0));
+        let cursor = mouse::Cursor::Available(position);
+        let modifiers_changed = iced::Event::Keyboard(
+            keyboard::Event::ModifiersChanged(modifiers),
+        );
+        let _ = editor_update(editor, &modifiers_changed, bounds, cursor);
+        let press = iced::Event::Mouse(mouse::Event::ButtonPressed(
+            mouse::Button::Left,
+        ));
+        let (message, _, status) = editor_update(editor, &press, bounds, cursor)
+            .expect("a press inside the editor publishes a message")
+            .into_inner();
+        (message, status)
+    }
+
+    fn text_point(editor: &CodeEditor, col: usize) -> Point {
+        Point::new(
+            editor.gutter_width() + 5.0 + editor.char_width() * col as f32,
+            editor.line_height / 2.0,
+        )
+    }
+
+    /// Regression (GitHub issue): Shift+click only moved the caret. A Shift
+    /// press must extend the selection from the caret to the click, and must
+    /// keep bubbling like a plain click so focus handling is unchanged.
+    #[test]
+    fn test_shift_press_extends_selection_from_caret() {
+        let mut editor = CodeEditor::new("hello world", "txt");
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(400.0, 300.0));
+
+        let (message, _) = press_with_modifiers(
+            &editor,
+            text_point(&editor, 1),
+            keyboard::Modifiers::default(),
+        );
+        let message = message.expect("plain press message");
+        assert!(matches!(message, Message::MouseClick(_)));
+        let _ = editor.update(&message);
+        let _ = editor.update(&Message::MouseRelease);
+
+        let (message, status) = press_with_modifiers(
+            &editor,
+            text_point(&editor, 9),
+            keyboard::Modifiers::SHIFT,
+        );
+        let message = message.expect("shift press message");
+        assert!(
+            matches!(message, Message::ShiftClick(_)),
+            "shift+press must publish ShiftClick, got {message:?}"
+        );
+        assert_eq!(
+            status,
+            iced::event::Status::Ignored,
+            "shift+click bubbles for focus management, like a plain click"
+        );
+        let _ = editor.update(&message);
+        assert_eq!(
+            editor.cursors.primary().selection_range(),
+            Some(((0, 1), (0, 9)))
+        );
+
+        // Holding the button and dragging keeps extending from the anchor.
+        let moved = iced::Event::Mouse(mouse::Event::CursorMoved {
+            position: text_point(&editor, 11),
+        });
+        let drag = editor_update(
+            &editor,
+            &moved,
+            bounds,
+            mouse::Cursor::Available(text_point(&editor, 11)),
+        )
+        .and_then(|action| action.into_inner().0)
+        .expect("drag message");
+        let _ = editor.update(&drag);
+        assert_eq!(
+            editor.cursors.primary().selection_range(),
+            Some(((0, 1), (0, 11)))
+        );
+
+        let release = iced::Event::Mouse(mouse::Event::ButtonReleased(
+            mouse::Button::Left,
+        ));
+        let release = editor_update(
+            &editor,
+            &release,
+            bounds,
+            mouse::Cursor::Available(text_point(&editor, 11)),
+        )
+        .and_then(|action| action.into_inner().0)
+        .expect("release message");
+        let _ = editor.update(&release);
+        assert!(!editor.is_dragging);
+        assert_eq!(editor.get_selected_text().as_deref(), Some("ello world"));
+    }
+
+    /// Ctrl/Cmd and Alt keep priority over Shift, and rapid repeated presses
+    /// still classify as double/triple clicks.
+    #[test]
+    fn test_shift_click_keeps_modifier_and_multi_click_precedence() {
+        let editor = CodeEditor::new("hello world", "txt");
+        let point = text_point(&editor, 3);
+
+        #[cfg(target_os = "macos")]
+        let jump = keyboard::Modifiers::SHIFT | keyboard::Modifiers::LOGO;
+        #[cfg(not(target_os = "macos"))]
+        let jump = keyboard::Modifiers::SHIFT | keyboard::Modifiers::CTRL;
+        let (message, _) = press_with_modifiers(&editor, point, jump);
+        assert!(matches!(message, Some(Message::JumpClick(_))));
+
+        let alt = keyboard::Modifiers::SHIFT | keyboard::Modifiers::ALT;
+        let (message, _) = press_with_modifiers(&editor, point, alt);
+        assert!(matches!(message, Some(Message::AltClick(_))));
+
+        let shift = keyboard::Modifiers::SHIFT;
+        let (message, _) = press_with_modifiers(&editor, point, shift);
+        assert!(matches!(message, Some(Message::ShiftClick(_))));
+        let (message, _) = press_with_modifiers(&editor, point, shift);
+        assert!(matches!(message, Some(Message::DoubleClick(_))));
+        let (message, _) = press_with_modifiers(&editor, point, shift);
+        assert!(matches!(message, Some(Message::TripleClick(_))));
     }
 
     /// A keystroke aimed at another widget must not reach an unfocused editor.
@@ -3770,6 +4082,7 @@ mod tests {
             whitespace_color: Color::from_rgba(1.0, 1.0, 1.0, 0.4),
             selection_color: Color::from_rgba(0.3, 0.5, 0.8, 0.3),
             json_key_color: Color::from_rgb(0.7, 0.5, 0.9),
+            token_colors: None,
             syntax_theme_name: Some("base16-mocha.dark"),
         };
         editor.set_theme(style);
@@ -3949,5 +4262,399 @@ mod tests {
             .map(|action| action.into_inner().0);
 
         assert!(matches!(message, Some(Some(Message::OpenGotoLine))));
+    }
+
+    /// Fold headers on lines 0 and 3.
+    fn two_block_editor() -> CodeEditor {
+        CodeEditor::new("a {\n    b\n}\nc {\n    d\n}", "rs")
+    }
+
+    /// Middle of a marker-wide gutter strip starting at `x`, on visual `row`.
+    fn gutter_point(editor: &CodeEditor, x: f32, row: usize) -> Point {
+        Point::new(
+            x + FOLD_MARGIN_WIDTH / 2.0,
+            editor.line_height * (row as f32 + 0.5),
+        )
+    }
+
+    fn move_pointer(
+        editor: &CodeEditor,
+        position: Point,
+    ) -> Option<Action<Message>> {
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(400.0, 300.0));
+        let moved = iced::Event::Mouse(mouse::Event::CursorMoved { position });
+        editor_update(
+            editor,
+            &moved,
+            bounds,
+            mouse::Cursor::Available(position),
+        )
+    }
+
+    fn pressed_fold(
+        editor: &CodeEditor,
+        point: Point,
+        modifiers: keyboard::Modifiers,
+    ) -> Option<usize> {
+        match press_with_modifiers(editor, point, modifiers).0 {
+            Some(Message::ToggleFold(line)) => Some(line),
+            _ => None,
+        }
+    }
+
+    fn lines_with_markers(editor: &CodeEditor) -> Vec<usize> {
+        editor
+            .visual_lines_cached(editor.viewport_width)
+            .iter()
+            .filter(|visual_line| editor.shows_fold_marker(visual_line))
+            .map(|visual_line| visual_line.logical_line)
+            .collect()
+    }
+
+    fn is_redraw_only(action: Option<Action<Message>>) -> bool {
+        action.map(Action::into_inner).is_some_and(|(message, redraw, _)| {
+            message.is_none() && redraw == RedrawRequest::NextFrame
+        })
+    }
+
+    #[test]
+    fn test_fold_marker_click_follows_marker_position() {
+        let mut editor = two_block_editor();
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(400.0, 300.0));
+        let outer = gutter_point(&editor, 0.0, 0);
+        let inner = gutter_point(&editor, GUTTER_WIDTH, 0);
+        let plain = keyboard::Modifiers::default();
+
+        assert_eq!(pressed_fold(&editor, inner, plain), Some(0));
+        assert_eq!(pressed_fold(&editor, outer, plain), None);
+
+        editor.set_fold_marker_position(FoldMarkerPosition::BeforeLineNumbers);
+        assert_eq!(pressed_fold(&editor, outer, plain), Some(0));
+        assert_eq!(pressed_fold(&editor, inner, plain), None);
+        assert_eq!(
+            pressed_fold(&editor, outer, keyboard::Modifiers::SHIFT),
+            Some(0),
+            "Shift+click on a marker folds, like a plain click"
+        );
+        assert_eq!(
+            editor_mouse_interaction(
+                &editor,
+                bounds,
+                mouse::Cursor::Available(outer)
+            ),
+            mouse::Interaction::Pointer
+        );
+    }
+
+    #[test]
+    fn test_on_gutter_hover_shows_markers_while_hovered_or_folded() {
+        let mut editor = two_block_editor();
+        editor.set_fold_markers(FoldMarkers::OnGutterHover);
+        editor.set_fold_marker_position(FoldMarkerPosition::BeforeLineNumbers);
+        let text = Point::new(editor.gutter_width() + 20.0, 5.0);
+        let plain = keyboard::Modifiers::default();
+
+        let _ = move_pointer(&editor, text);
+        assert!(lines_with_markers(&editor).is_empty());
+        assert_eq!(
+            pressed_fold(&editor, gutter_point(&editor, 0.0, 0), plain),
+            None
+        );
+
+        let _ = move_pointer(&editor, gutter_point(&editor, 0.0, 0));
+        assert_eq!(lines_with_markers(&editor), [0, 3]);
+        assert_eq!(
+            pressed_fold(&editor, gutter_point(&editor, 0.0, 0), plain),
+            Some(0)
+        );
+
+        editor.toggle_fold(0);
+        let _ = move_pointer(&editor, text);
+        assert_eq!(
+            lines_with_markers(&editor),
+            [0],
+            "folded lines keep theirs"
+        );
+        assert_eq!(
+            pressed_fold(&editor, gutter_point(&editor, 0.0, 0), plain),
+            Some(0)
+        );
+        // Line 3 now sits on visual row 2, and its hidden marker is inert.
+        assert_eq!(
+            pressed_fold(&editor, gutter_point(&editor, 0.0, 2), plain),
+            None
+        );
+    }
+
+    #[test]
+    fn test_gutter_hover_changes_request_one_redraw() {
+        let mut editor = two_block_editor();
+        editor.set_fold_markers(FoldMarkers::OnGutterHover);
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(400.0, 300.0));
+        let gutter = Point::new(5.0, 5.0);
+        let outside = Point::new(500.0, 5.0);
+        let cursor_left = iced::Event::Mouse(mouse::Event::CursorLeft);
+
+        let entered = move_pointer(&editor, gutter).map(Action::into_inner);
+        assert!(matches!(entered, Some((Some(Message::MouseHover(_)), _, _))));
+        assert!(editor.gutter_hovered.get());
+
+        assert!(is_redraw_only(move_pointer(&editor, outside)));
+        assert!(!editor.gutter_hovered.get());
+        assert!(move_pointer(&editor, outside).is_none());
+
+        let _ = move_pointer(&editor, gutter);
+        let unavailable = mouse::Cursor::Unavailable;
+        assert!(is_redraw_only(editor_update(
+            &editor,
+            &cursor_left,
+            bounds,
+            unavailable
+        )));
+        assert!(
+            editor_update(&editor, &cursor_left, bounds, unavailable).is_none()
+        );
+
+        editor.set_fold_markers(FoldMarkers::Always);
+        let _ = move_pointer(&editor, gutter);
+        assert!(move_pointer(&editor, outside).is_none());
+    }
+
+    #[test]
+    fn test_never_fold_markers_leave_no_click_targets() {
+        let mut editor = two_block_editor();
+        editor.set_fold_markers(FoldMarkers::Never);
+        editor.toggle_fold(0);
+        let _ = move_pointer(&editor, Point::new(5.0, 5.0));
+
+        for position in [
+            FoldMarkerPosition::BeforeLineNumbers,
+            FoldMarkerPosition::AfterLineNumbers,
+        ] {
+            editor.set_fold_marker_position(position);
+            assert!(lines_with_markers(&editor).is_empty());
+            for x in [0.0, 7.0, 20.0, GUTTER_WIDTH - 1.0] {
+                assert_eq!(
+                    editor.fold_header_at_point(Point::new(x, 5.0)),
+                    None
+                );
+            }
+        }
+
+        let key = keyboard::Key::Character("k".into());
+        let message = editor
+            .handle_keyboard_shortcuts(&key, &key, &keyboard::Modifiers::CTRL)
+            .and_then(|action| action.into_inner().0);
+        assert!(matches!(message, Some(Message::FoldAll)));
+    }
+
+    #[test]
+    fn test_custom_gutter_layout_fold_clicks_follow_marker_column() {
+        let mut editor = two_block_editor();
+        editor.set_gutter_layout(GutterLayout {
+            width: 52.0,
+            number_size: 12.0,
+            number_right_padding: 16.0,
+        });
+        let plain = keyboard::Modifiers::default();
+        let left = gutter_point(&editor, 0.0, 0);
+        let right = gutter_point(&editor, 52.0 - FOLD_MARGIN_WIDTH, 0);
+
+        assert_eq!(pressed_fold(&editor, right, plain), Some(0));
+        assert_eq!(pressed_fold(&editor, left, plain), None);
+
+        editor.set_fold_marker_position(FoldMarkerPosition::BeforeLineNumbers);
+        assert_eq!(pressed_fold(&editor, left, plain), Some(0));
+        assert_eq!(pressed_fold(&editor, right, plain), None);
+    }
+
+    const KEY: Color = Color::from_rgb(0.9, 0.1, 0.1);
+    const STRING: Color = Color::from_rgb(0.1, 0.9, 0.1);
+    const NUMBER: Color = Color::from_rgb(0.1, 0.1, 0.9);
+    const LITERAL: Color = Color::from_rgb(0.9, 0.9, 0.1);
+    const PUNCTUATION: Color = Color::from_rgb(0.5, 0.5, 0.5);
+
+    fn sample_token_colors() -> TokenColors {
+        TokenColors {
+            key: Some(KEY),
+            string: Some(STRING),
+            number: Some(NUMBER),
+            literal: Some(LITERAL),
+            punctuation: Some(PUNCTUATION),
+        }
+    }
+
+    fn editor_with_token_colors(
+        content: &str,
+        syntax: &str,
+        token_colors: Option<TokenColors>,
+    ) -> CodeEditor {
+        let mut editor = CodeEditor::new(content, syntax);
+        let mut style = editor.style;
+        style.token_colors = token_colors;
+        editor.set_theme(style);
+        editor
+    }
+
+    /// Every highlighted span of the document, as `(text, color)`.
+    fn highlighted_tokens(editor: &CodeEditor) -> Vec<(String, Color)> {
+        let syntax_set = SyntaxSet::load_defaults_newlines();
+        let theme_set = ThemeSet::load_defaults();
+        let syntax = syntax_set
+            .find_syntax_by_extension(&editor.syntax)
+            .expect("bundled syntax");
+        let theme = &theme_set.themes["base16-mocha.dark"];
+        (0..editor.buffer.line_count())
+            .flat_map(|line| {
+                editor
+                    .highlighted_line_cached(line, syntax, theme, &syntax_set)
+                    .iter()
+                    .map(|(color, text)| (text.clone(), *color))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn colors_of(tokens: &[(String, Color)], text: &str) -> Vec<Color> {
+        tokens
+            .iter()
+            .filter(|(token, _)| token == text)
+            .map(|(_, color)| *color)
+            .collect()
+    }
+
+    #[test]
+    fn test_token_colors_apply_by_scope_in_json() {
+        let editor = editor_with_token_colors(
+            r#"{"a": 1.5, "b": "x", "c": true, "d": null}"#,
+            "json",
+            Some(sample_token_colors()),
+        );
+        let tokens = highlighted_tokens(&editor);
+
+        for key in ["a", "b", "c", "d"] {
+            assert_eq!(colors_of(&tokens, key), [KEY], "{key}");
+        }
+        assert_eq!(colors_of(&tokens, "x"), [STRING]);
+        assert_eq!(colors_of(&tokens, "1.5"), [NUMBER]);
+        assert_eq!(colors_of(&tokens, "true"), [LITERAL]);
+        assert_eq!(colors_of(&tokens, "null"), [LITERAL]);
+        assert_eq!(colors_of(&tokens, "{"), [PUNCTUATION]);
+        assert_eq!(colors_of(&tokens, "}"), [PUNCTUATION]);
+        assert_eq!(colors_of(&tokens, ":"), [PUNCTUATION; 4]);
+        assert_eq!(colors_of(&tokens, ","), [PUNCTUATION; 3]);
+        // Quotes take the color of what they delimit: keys a, b, then "x".
+        let quotes = colors_of(&tokens, "\"");
+        assert_eq!(quotes[..6], [KEY, KEY, KEY, KEY, STRING, STRING]);
+    }
+
+    #[test]
+    fn test_token_colors_match_yaml_and_javascript_scopes() {
+        let yaml = highlighted_tokens(&editor_with_token_colors(
+            "key: value\ncount: 3\nflag: true",
+            "yaml",
+            Some(sample_token_colors()),
+        ));
+        assert_eq!(colors_of(&yaml, "key"), [KEY]);
+        assert_eq!(colors_of(&yaml, "value"), [STRING]);
+        assert_eq!(colors_of(&yaml, "3"), [NUMBER]);
+        assert_eq!(colors_of(&yaml, "true"), [LITERAL]);
+
+        let source = "const o = { a: 1, 'b': \"s\", c: true };\n\
+                      const t = `x${y}`; // note";
+        let js = highlighted_tokens(&editor_with_token_colors(
+            source,
+            "js",
+            Some(sample_token_colors()),
+        ));
+        for key in ["a", "b", "c"] {
+            assert_eq!(colors_of(&js, key), [KEY], "{key}");
+        }
+        assert_eq!(colors_of(&js, "s"), [STRING]);
+        assert_eq!(colors_of(&js, "x"), [STRING]);
+        assert_eq!(colors_of(&js, "1"), [NUMBER]);
+        assert_eq!(colors_of(&js, "{"), [PUNCTUATION]);
+
+        let themed =
+            highlighted_tokens(&editor_with_token_colors(source, "js", None));
+        for kept in ["//", "y", "const"] {
+            assert!(!colors_of(&themed, kept).is_empty(), "{kept}");
+            assert_eq!(
+                colors_of(&js, kept),
+                colors_of(&themed, kept),
+                "{kept} keeps the theme's color"
+            );
+        }
+
+        let shell = r#"echo "a $(ls)""#;
+        let colored = highlighted_tokens(&editor_with_token_colors(
+            shell,
+            "sh",
+            Some(sample_token_colors()),
+        ));
+        let themed =
+            highlighted_tokens(&editor_with_token_colors(shell, "sh", None));
+        assert_eq!(colors_of(&colored, "a "), [STRING]);
+        assert!(!colors_of(&themed, "ls").is_empty());
+        assert_eq!(
+            colors_of(&colored, "ls"),
+            colors_of(&themed, "ls"),
+            "code nested in a string keeps the theme's color"
+        );
+    }
+
+    #[test]
+    fn test_token_colors_default_off_and_key_falls_back_to_json_key_color() {
+        let editor = CodeEditor::new("{}", "json");
+        assert_eq!(editor.style.token_colors, None);
+        let tokens = highlighted_tokens(&editor_with_token_colors(
+            r#"{"a": "x"}"#,
+            "json",
+            None,
+        ));
+        assert_eq!(
+            colors_of(&tokens, "a"),
+            colors_of(&tokens, "x"),
+            "without token colors, keys are only recolored when drawn"
+        );
+
+        let editor = editor_with_token_colors(
+            r#"{"a": "x"}"#,
+            "json",
+            Some(TokenColors {
+                string: Some(STRING),
+                ..TokenColors::default()
+            }),
+        );
+        let tokens = highlighted_tokens(&editor);
+        assert_eq!(colors_of(&tokens, "a"), [editor.style.json_key_color]);
+        assert_eq!(colors_of(&tokens, "x"), [STRING]);
+    }
+
+    #[test]
+    fn test_token_colors_are_cached_until_the_style_changes() {
+        let mut editor = editor_with_token_colors(
+            r#"{"a": 1}"#,
+            "json",
+            Some(sample_token_colors()),
+        );
+        let syntax_set = SyntaxSet::load_defaults_newlines();
+        let syntax = syntax_set.find_syntax_by_extension("json").expect("json");
+        let theme = syntect::highlighting::Theme::default();
+        let highlight =
+            |editor: &CodeEditor| editor.highlighted_line_cached(0, syntax, &theme, &syntax_set);
+
+        let first = highlight(&editor);
+        editor.set_theme(editor.style);
+        assert!(Rc::ptr_eq(&first, &highlight(&editor)));
+
+        let number = Color::from_rgb(1.0, 0.5, 0.0);
+        let mut style = editor.style;
+        style.token_colors =
+            Some(TokenColors { number: Some(number), ..sample_token_colors() });
+        editor.set_theme(style);
+        let recolored = highlight(&editor);
+        assert!(!Rc::ptr_eq(&first, &recolored));
+        assert!(recolored.iter().any(|(color, text)| text == "1" && *color == number));
     }
 }

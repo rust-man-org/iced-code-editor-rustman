@@ -159,7 +159,7 @@ impl CodeEditor {
         // until the next scroll event happens to correct it. Clamp it here
         // so the very next frame is already correct.
         let visual_lines = self.visual_lines_cached(self.viewport_width);
-        let content_height = visual_lines.len() as f32 * self.line_height;
+        let content_height = self.content_height(visual_lines.len());
         let max_scroll = (content_height - self.viewport_height).max(0.0);
         if self.viewport_scroll > max_scroll {
             self.viewport_scroll = max_scroll;
@@ -1703,6 +1703,28 @@ impl CodeEditor {
         }
     }
 
+    /// Returns the position a Shift+click extends the selection from: the
+    /// primary selection's anchor, or the caret when nothing is selected.
+    ///
+    /// In Vim Visual modes the Vim state owns the selection, so its inclusive
+    /// anchor is used instead. For a backward Visual selection the half-open
+    /// cursor anchor sits one column past the Vim anchor, and the conversion
+    /// back into Visual mode on release (`handle_mouse_release_msg`) would
+    /// otherwise shift the anchor by a character.
+    fn shift_click_anchor(&self) -> (usize, usize) {
+        if self.vim_enabled
+            && matches!(
+                self.vim_state.mode(),
+                VimMode::Visual | VimMode::VisualLine
+            )
+            && let Some((anchor, _)) = self.vim_state.visual_positions()
+        {
+            return anchor;
+        }
+        let primary = self.cursors.primary();
+        primary.anchor.unwrap_or(primary.position)
+    }
+
     /// Handles mouse click operations.
     ///
     /// Sets focus, ends command grouping, positions cursor, starts selection tracking.
@@ -1710,11 +1732,20 @@ impl CodeEditor {
     /// # Arguments
     ///
     /// * `point` - The click position
+    /// * `extend_selection` - `true` for Shift+click: keep the existing
+    ///   selection anchor (or the caret, if nothing is selected) so the
+    ///   selection runs from there to the click, and so a drag that follows
+    ///   keeps extending from that same anchor. `false` starts a fresh
+    ///   selection at the click.
     ///
     /// # Returns
     ///
     /// A `Task<Message>` (currently Task::none() as no scrolling is needed)
-    fn handle_mouse_click_msg(&mut self, point: iced::Point) -> Task<Message> {
+    fn handle_mouse_click_msg(
+        &mut self,
+        point: iced::Point,
+        extend_selection: bool,
+    ) -> Task<Message> {
         // Capture focus when clicked using the new focus method
         self.request_focus();
 
@@ -1734,12 +1765,21 @@ impl CodeEditor {
         // positioned at the click location.
         self.cursors.remove_all_but_primary();
 
+        // Read before the caret moves: the anchor may be the old caret.
+        let extend_from = extend_selection.then(|| self.shift_click_anchor());
+
         self.handle_mouse_click(point);
         self.reset_cursor_blink();
-        // Clear selection on click, then set anchor for potential drag selection
-        self.clear_selection();
+        if let Some(anchor) = extend_from {
+            // Shift+click: select from the kept anchor to the click.
+            self.cursors.primary_mut().anchor = Some(anchor);
+            self.overlay_cache.clear();
+        } else {
+            // Clear selection on click, then set anchor for potential drag selection
+            self.clear_selection();
+            self.cursors.primary_mut().set_anchor();
+        }
         self.is_dragging = true;
-        self.cursors.primary_mut().set_anchor();
         self.sync_search_match_from_primary_cursor();
 
         // Show cursor when focused
@@ -2565,8 +2605,7 @@ impl CodeEditor {
         let scroll_changed = (self.viewport_scroll - new_scroll).abs() > 0.1;
         let visible_lines_count =
             (new_height / self.line_height).ceil() as usize + 2;
-        let first_visible_line =
-            (new_scroll / self.line_height).floor() as usize;
+        let first_visible_line = self.first_visible_index(new_scroll);
         let last_visible_line = first_visible_line + visible_lines_count;
         let margin = visible_lines_count
             * crate::canvas_editor::CACHE_WINDOW_MARGIN_MULTIPLIER;
@@ -2858,7 +2897,12 @@ impl CodeEditor {
             Message::PageDown => self.handle_page_down(),
 
             // Mouse and selection operations
-            Message::MouseClick(point) => self.handle_mouse_click_msg(*point),
+            Message::MouseClick(point) => {
+                self.handle_mouse_click_msg(*point, false)
+            }
+            Message::ShiftClick(point) => {
+                self.handle_mouse_click_msg(*point, true)
+            }
             Message::MouseDrag(point) => self.handle_mouse_drag_msg(*point),
             Message::MouseHover(point) => self.handle_mouse_drag_msg(*point),
             Message::MouseRelease => self.handle_mouse_release_msg(),
@@ -4330,6 +4374,173 @@ mod tests {
 
         assert!(editor.has_canvas_focus);
         assert!(editor.show_cursor);
+    }
+
+    /// Canvas point over column `col` of logical line `line` (no wrap, no
+    /// horizontal scroll).
+    fn point_at(editor: &CodeEditor, line: usize, col: usize) -> iced::Point {
+        iced::Point::new(
+            editor.gutter_width() + 5.0 + editor.char_width() * col as f32,
+            editor.line_height * (line as f32 + 0.5),
+        )
+    }
+
+    #[test]
+    fn test_shift_click_selects_from_caret_to_click() {
+        let mut editor = CodeEditor::new("hello world\nsecond line", "txt");
+
+        let _ = editor.update(&Message::MouseClick(point_at(&editor, 0, 2)));
+        let _ = editor.update(&Message::MouseRelease);
+        assert_eq!(editor.cursors.primary().selection_range(), None);
+
+        let _ = editor.update(&Message::ShiftClick(point_at(&editor, 1, 3)));
+        let _ = editor.update(&Message::MouseRelease);
+
+        assert_eq!(
+            editor.cursors.primary().selection_range(),
+            Some(((0, 2), (1, 3)))
+        );
+        assert_eq!(editor.cursors.primary_position(), (1, 3));
+        assert_eq!(editor.get_selected_text().as_deref(), Some("llo world\nsec"));
+
+        // With no anchor at all (caret placed programmatically), the caret is
+        // the anchor.
+        let mut editor = CodeEditor::new("hello world", "txt");
+        editor.cursors.set_single((0, 8));
+        let _ = editor.update(&Message::ShiftClick(point_at(&editor, 0, 1)));
+        assert_eq!(
+            editor.cursors.primary().selection_range(),
+            Some(((0, 1), (0, 8)))
+        );
+        assert_eq!(editor.cursors.primary_position(), (0, 1));
+    }
+
+    #[test]
+    fn test_shift_click_extends_and_shrinks_from_original_anchor() {
+        let mut editor = CodeEditor::new("0123456789abcdef", "txt");
+
+        let _ = editor.update(&Message::MouseClick(point_at(&editor, 0, 4)));
+        let _ = editor.update(&Message::MouseDrag(point_at(&editor, 0, 8)));
+        let _ = editor.update(&Message::MouseRelease);
+        assert_eq!(
+            editor.cursors.primary().selection_range(),
+            Some(((0, 4), (0, 8)))
+        );
+
+        let shift_click = |editor: &mut CodeEditor, col: usize| {
+            let _ = editor.update(&Message::ShiftClick(point_at(editor, 0, col)));
+            let _ = editor.update(&Message::MouseRelease);
+            editor.cursors.primary().selection_range()
+        };
+
+        // Extend past the end, shrink back, then cross over the anchor: the
+        // anchor stays where the original selection started throughout.
+        assert_eq!(shift_click(&mut editor, 12), Some(((0, 4), (0, 12))));
+        assert_eq!(shift_click(&mut editor, 6), Some(((0, 4), (0, 6))));
+        assert_eq!(shift_click(&mut editor, 1), Some(((0, 1), (0, 4))));
+        assert_eq!(editor.cursors.primary().anchor, Some((0, 4)));
+        assert_eq!(shift_click(&mut editor, 4), None);
+
+        // A keyboard selection's anchor is honoured too.
+        editor.cursors.set_single((0, 10));
+        let _ = editor.update(&Message::ArrowKey(ArrowDirection::Left, true));
+        let _ = editor.update(&Message::ArrowKey(ArrowDirection::Left, true));
+        assert_eq!(
+            editor.cursors.primary().selection_range(),
+            Some(((0, 8), (0, 10)))
+        );
+        assert_eq!(shift_click(&mut editor, 14), Some(((0, 10), (0, 14))));
+    }
+
+    #[test]
+    fn test_shift_click_then_drag_continues_from_anchor() {
+        let mut editor = CodeEditor::new("0123456789abcdef", "txt");
+
+        let _ = editor.update(&Message::MouseClick(point_at(&editor, 0, 3)));
+        let _ = editor.update(&Message::MouseRelease);
+
+        // Press with Shift and keep the button down while dragging.
+        let _ = editor.update(&Message::ShiftClick(point_at(&editor, 0, 7)));
+        assert!(editor.is_dragging, "shift+click must start drag tracking");
+        let _ = editor.update(&Message::MouseDrag(point_at(&editor, 0, 10)));
+        assert_eq!(
+            editor.cursors.primary().selection_range(),
+            Some(((0, 3), (0, 10)))
+        );
+        let _ = editor.update(&Message::MouseDrag(point_at(&editor, 0, 1)));
+        assert_eq!(
+            editor.cursors.primary().selection_range(),
+            Some(((0, 1), (0, 3)))
+        );
+
+        let _ = editor.update(&Message::MouseRelease);
+        assert!(!editor.is_dragging);
+        assert_eq!(
+            editor.cursors.primary().selection_range(),
+            Some(((0, 1), (0, 3)))
+        );
+
+        // A plain click afterwards still collapses the selection.
+        let _ = editor.update(&Message::MouseClick(point_at(&editor, 0, 5)));
+        let _ = editor.update(&Message::MouseRelease);
+        assert_eq!(editor.cursors.primary().selection_range(), None);
+        assert_eq!(editor.cursors.primary_position(), (0, 5));
+    }
+
+    #[test]
+    fn test_shift_click_takes_focus_and_collapses_multi_cursor() {
+        let mut editor = CodeEditor::new("same\nsame\nsame", "txt");
+        editor.request_focus();
+        editor.has_canvas_focus = true;
+        let _ = editor.update(&Message::CanvasFocusLost);
+        assert!(!editor.has_focus());
+        assert!(editor.focus_locked);
+        editor.show_cursor = false;
+
+        editor.cursors.set_single((0, 1));
+        editor.cursors.add_cursor((1, 1));
+        editor.cursors.add_cursor((2, 1));
+        assert_eq!(editor.cursors.len(), 3);
+        let primary = editor.cursors.primary_position();
+
+        let _ = editor.update(&Message::ShiftClick(point_at(&editor, 2, 3)));
+
+        assert!(editor.has_focus(), "shift+click must restore focus");
+        assert!(editor.has_canvas_focus);
+        assert!(!editor.focus_locked);
+        assert!(editor.show_cursor);
+        assert_eq!(editor.cursors.len(), 1);
+        assert_eq!(editor.cursors.primary().anchor, Some(primary));
+        assert_eq!(editor.cursors.primary_position(), (2, 3));
+    }
+
+    #[test]
+    fn test_vim_shift_click_extends_into_visual_mode() {
+        let mut editor =
+            CodeEditor::new("0123456789abcdef", "txt").with_vim_enabled(true);
+        editor.cursors.set_single((0, 2));
+        assert_eq!(editor.vim_mode(), Some(VimMode::Normal));
+
+        // From Normal mode: the block caret is the anchor and release enters
+        // Visual mode, as a mouse drag does.
+        let _ = editor.update(&Message::ShiftClick(point_at(&editor, 0, 6)));
+        let _ = editor.update(&Message::MouseRelease);
+        assert_eq!(editor.vim_mode(), Some(VimMode::Visual));
+        assert_eq!(editor.vim_state.visual_positions(), Some(((0, 2), (0, 5))));
+
+        // From a backward Visual selection the Vim anchor character is kept,
+        // not the half-open cursor anchor one column to its right.
+        let _ = editor.update(&Message::VimKey('\u{1b}'));
+        editor.cursors.set_single((0, 8));
+        vim_keys(&mut editor, "vhh");
+        assert_eq!(editor.vim_state.visual_positions(), Some(((0, 8), (0, 6))));
+        let _ = editor.update(&Message::ShiftClick(point_at(&editor, 0, 12)));
+        let _ = editor.update(&Message::MouseRelease);
+        assert_eq!(editor.vim_mode(), Some(VimMode::Visual));
+        assert_eq!(
+            editor.vim_state.visual_positions(),
+            Some(((0, 8), (0, 11)))
+        );
     }
 
     #[test]

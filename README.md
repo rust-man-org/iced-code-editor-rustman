@@ -355,6 +355,22 @@ if editor.is_folded(0) {
 
 When folding is disabled, the collapsed state is preserved (so re-enabling restores the previously collapsed blocks) but no lines are hidden.
 
+### Fold markers
+
+By default the fold chevrons are always shown, between the line numbers and the text. Both can be changed:
+
+```rust
+use iced_code_editor::{FoldMarkerPosition, FoldMarkers};
+
+// Show chevrons only while the pointer is over the gutter (a folded block keeps its ▶)
+editor.set_fold_markers(FoldMarkers::OnGutterHover);
+
+// Draw them left of the line numbers
+editor.set_fold_marker_position(FoldMarkerPosition::BeforeLineNumbers);
+```
+
+`FoldMarkers::Never` hides the chevrons and frees their column; blocks still fold with the keyboard shortcuts and the methods above.
+
 ### Enable/disable line numbers
 
 Line numbers are **displayed by default**. They can be hidden to maximize space for code:
@@ -377,6 +393,21 @@ if editor.line_numbers_enabled() {
 ```
 
 When disabled, the gutter is completely removed (0px width), providing more horizontal space for code display.
+
+### Gutter layout and content padding
+
+By default the line numbers are centered in a 45px column and the text starts 5px after the gutter. A custom layout sets the whole gutter width (the fold-marker column fits inside it), right-aligns the numbers and starts the text right at the gutter edge. Content padding adds space above the first line and below the last:
+
+```rust
+use iced_code_editor::GutterLayout;
+
+editor.set_gutter_layout(GutterLayout {
+    width: 52.0,
+    number_size: 12.0,
+    number_right_padding: 16.0,
+});
+editor.set_content_padding(8.0, 8.0); // top, bottom
+```
 
 ### Indentation
 
@@ -542,6 +573,23 @@ Each theme automatically provides:
 - Subtle current line highlighting
 
 The editor intelligently adapts colors from the Iced theme palette for optimal code readability.
+
+### Token colors
+
+`Style::token_colors` overrides the syntax theme for keys, strings, numbers, literals (`true`, `false`, `null`) and punctuation. The overrides are matched by scope, so they apply to JSON, YAML, JavaScript and other grammars using the usual scope names. A `None` field keeps the theme's color; `key` falls back to `Style::json_key_color`.
+
+```rust
+use iced::Color;
+use iced_code_editor::{TokenColors, from_iced_theme};
+
+let mut style = from_iced_theme(&iced::Theme::Dark);
+style.token_colors = Some(TokenColors {
+    string: Some(Color::from_rgb8(0x98, 0xc3, 0x79)),
+    number: Some(Color::from_rgb8(0xd1, 0x9a, 0x66)),
+    ..TokenColors::default()
+});
+editor.set_theme(style);
+```
 
 ## Supported Languages
 

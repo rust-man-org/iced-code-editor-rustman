@@ -39,6 +39,39 @@ impl FoldRegion {
     }
 }
 
+/// When the gutter draws fold markers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FoldMarkers {
+    /// Always shown.
+    #[default]
+    Always,
+    /// Shown while the pointer is over the gutter, and always on folded lines.
+    OnGutterHover,
+    /// Never shown, taking no gutter space; keys and the API still fold.
+    Never,
+}
+
+impl FoldMarkers {
+    /// Whether a fold header shows its marker.
+    pub(crate) fn is_visible(self, folded: bool, gutter_hovered: bool) -> bool {
+        match self {
+            Self::Always => true,
+            Self::OnGutterHover => folded || gutter_hovered,
+            Self::Never => false,
+        }
+    }
+}
+
+/// Which side of the line numbers the fold-marker column sits on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FoldMarkerPosition {
+    /// Left of the line numbers, at the outer edge of the gutter.
+    BeforeLineNumbers,
+    /// Between the line numbers and the text.
+    #[default]
+    AfterLineNumbers,
+}
+
 /// Computes the visual indentation width of a line, expanding tabs.
 ///
 /// Returns `None` for blank lines (empty or whitespace-only), which have no
@@ -283,6 +316,30 @@ mod tests {
         assert!(is_fold_header(&regions, 5));
         assert!(!is_fold_header(&regions, 1));
         assert!(!is_fold_header(&regions, 3));
+    }
+
+    #[test]
+    fn test_fold_marker_visibility() {
+        for folded in [false, true] {
+            for hovered in [false, true] {
+                assert!(FoldMarkers::Always.is_visible(folded, hovered));
+                assert!(!FoldMarkers::Never.is_visible(folded, hovered));
+            }
+        }
+        let on_hover = FoldMarkers::OnGutterHover;
+        assert!(!on_hover.is_visible(false, false));
+        assert!(on_hover.is_visible(false, true));
+        assert!(on_hover.is_visible(true, false));
+        assert!(on_hover.is_visible(true, true));
+    }
+
+    #[test]
+    fn test_fold_marker_defaults_keep_existing_behavior() {
+        assert_eq!(FoldMarkers::default(), FoldMarkers::Always);
+        assert_eq!(
+            FoldMarkerPosition::default(),
+            FoldMarkerPosition::AfterLineNumbers
+        );
     }
 
     #[test]

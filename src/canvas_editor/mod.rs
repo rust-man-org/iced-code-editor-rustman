@@ -24,6 +24,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::i18n::Translations;
 use crate::text_buffer::TextBuffer;
 use crate::theme::Style;
+use folding::{FoldMarkerPosition, FoldMarkers};
 pub use history::CommandHistory;
 
 #[cfg(target_arch = "wasm32")]
@@ -246,6 +247,8 @@ pub(crate) const GUTTER_WIDTH: f32 = 45.0;
 /// Width in pixels of the fold margin (chevron column) added to the gutter when
 /// code folding is enabled.
 pub(crate) const FOLD_MARGIN_WIDTH: f32 = 14.0;
+/// Gap between the gutter and the text in the built-in gutter layout.
+pub(crate) const TEXT_LEFT_PADDING: f32 = 5.0;
 pub(crate) const CURSOR_BLINK_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(530);
 /// How long after construction the editor keeps re-verifying its char-width
@@ -485,6 +488,18 @@ pub struct CodeEditor {
     /// Cached foldable regions, keyed by `buffer_revision`.
     pub(crate) foldable_regions_cache:
         RefCell<Option<(u64, Rc<Vec<folding::FoldRegion>>)>>,
+    /// When fold markers are drawn in the gutter.
+    pub(crate) fold_markers: FoldMarkers,
+    /// Which side of the line numbers the fold markers are drawn on.
+    pub(crate) fold_marker_position: FoldMarkerPosition,
+    /// Whether the pointer was over the gutter at the last pointer event.
+    pub(crate) gutter_hovered: Cell<bool>,
+    /// Custom gutter geometry; `None` keeps the built-in layout.
+    pub(crate) gutter_layout: Option<GutterLayout>,
+    /// Space above the first line, in scroll-content pixels.
+    pub(crate) padding_top: f32,
+    /// Space below the last line, in scroll-content pixels.
+    pub(crate) padding_bottom: f32,
     /// Search state
     pub(crate) search_state: search::SearchState,
     /// Custom entries displayed before the built-in context-menu actions.
@@ -611,6 +626,13 @@ pub struct CodeEditor {
     /// Together with `pre_edit_line`, this bounds the portion of the visual-line
     /// cache that must be rebuilt after a localized edit.
     pub(crate) pre_edit_last_line: usize,
+}
+
+/// Horizontal extents of the gutter columns, in canvas coordinates.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GutterColumns {
+    pub(crate) line_numbers: Range<f32>,
+    pub(crate) fold_markers: Range<f32>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -794,6 +816,10 @@ pub enum Message {
     ArrowKey(ArrowDirection, bool),
     /// Mouse clicked at position
     MouseClick(iced::Point),
+    /// Shift+click: extend the primary selection from its existing anchor
+    /// (or from the caret when nothing is selected) to the clicked position.
+    /// Focus handling and drag tracking are the same as [`Message::MouseClick`].
+    ShiftClick(iced::Point),
     /// Mouse drag for selection
     MouseDrag(iced::Point),
     /// Mouse moved within the editor without dragging
@@ -924,6 +950,20 @@ pub enum Message {
     ToggleComment,
 }
 
+/// Custom gutter geometry, set with [`CodeEditor::set_gutter_layout`].
+///
+/// The fold-marker column fits inside `width`, line numbers are right-aligned,
+/// and the text starts right at the gutter edge.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GutterLayout {
+    /// Total gutter width in pixels.
+    pub width: f32,
+    /// Font size of the line numbers.
+    pub number_size: f32,
+    /// Gap between the numbers and the right edge of their column.
+    pub number_right_padding: f32,
+}
+
 /// Indentation style used when pressing the Tab key.
 ///
 /// Controls whether indentation inserts spaces or a tab character.
@@ -1016,6 +1056,12 @@ impl CodeEditor {
             collapsed_folds: HashSet::new(),
             fold_revision: 0,
             foldable_regions_cache: RefCell::new(None),
+            fold_markers: FoldMarkers::default(),
+            fold_marker_position: FoldMarkerPosition::default(),
+            gutter_hovered: Cell::new(false),
+            gutter_layout: None,
+            padding_top: 0.0,
+            padding_bottom: 0.0,
             search_state: search::SearchState::new(),
             custom_context_menu_entries: Vec::new(),
             default_context_menu_enabled: true,
@@ -1406,6 +1452,9 @@ impl CodeEditor {
     /// editor.set_theme(theme::from_iced_theme(&iced::Theme::TokyoNightStorm));
     /// ```
     pub fn set_theme(&mut self, style: Style) {
+        if !self.style.highlights_like(&style) {
+            self.reset_highlighting();
+        }
         self.style = style;
         self.content_cache.clear();
         self.overlay_cache.clear();
@@ -1804,15 +1853,13 @@ impl CodeEditor {
             .skip(visual_line.start_col)
             .take(prefix_len)
             .collect();
-        let x = self.gutter_width()
-            + 5.0
+        let x = self.text_start_x()
             + measure_text_width(
                 &prefix_text,
                 self.full_char_width.get(),
                 self.char_width.get(),
             );
-        let y = visual_index as f32 * self.line_height;
-        Some(iced::Point::new(x, y))
+        Some(iced::Point::new(x, self.line_top(visual_index)))
     }
 
     /// Returns the word-start column in a line for a given column.
@@ -2123,6 +2170,52 @@ impl CodeEditor {
     /// Returns whether code folding is enabled.
     pub fn folding_enabled(&self) -> bool {
         self.folding_enabled
+    }
+
+    /// Sets when fold markers are drawn in the gutter.
+    pub fn set_fold_markers(&mut self, mode: FoldMarkers) {
+        if self.fold_markers != mode {
+            self.fold_markers = mode;
+            self.content_cache.clear();
+            self.overlay_cache.clear();
+        }
+    }
+
+    /// Returns when fold markers are drawn in the gutter.
+    pub fn fold_markers(&self) -> FoldMarkers {
+        self.fold_markers
+    }
+
+    /// Sets which side of the line numbers the fold markers are drawn on.
+    pub fn set_fold_marker_position(&mut self, position: FoldMarkerPosition) {
+        if self.fold_marker_position != position {
+            self.fold_marker_position = position;
+            self.content_cache.clear();
+        }
+    }
+
+    /// Returns which side of the line numbers the fold markers are drawn on.
+    pub fn fold_marker_position(&self) -> FoldMarkerPosition {
+        self.fold_marker_position
+    }
+
+    /// Replaces the built-in gutter geometry with `layout`.
+    pub fn set_gutter_layout(&mut self, layout: GutterLayout) {
+        if self.gutter_layout != Some(layout) {
+            self.gutter_layout = Some(layout);
+            self.content_cache.clear();
+            self.overlay_cache.clear();
+        }
+    }
+
+    /// Sets the space above the first line and below the last one, in pixels.
+    pub fn set_content_padding(&mut self, top: f32, bottom: f32) {
+        let padding = (top.max(0.0), bottom.max(0.0));
+        if (self.padding_top, self.padding_bottom) != padding {
+            (self.padding_top, self.padding_bottom) = padding;
+            self.content_cache.clear();
+            self.overlay_cache.clear();
+        }
     }
 
     /// Returns whether the region whose header is `header_line` is collapsed.
@@ -2488,11 +2581,16 @@ impl CodeEditor {
         self.syntax = syntax;
         // The highlight cache records which syntax produced it; drop it so the
         // whole document is re-tokenized under the new language.
+        self.reset_highlighting();
+        self.content_cache.clear();
+        self.overlay_cache.clear();
+    }
+
+    /// Drops every highlighted line so the document is re-tokenized.
+    fn reset_highlighting(&self) {
         *self.highlight_cache.borrow_mut() = None;
         self.highlight_lines_remaining.set(usize::MAX);
         self.highlight_catch_up_pending.set(false);
-        self.content_cache.clear();
-        self.overlay_cache.clear();
     }
 
     /// Opens the search dialog programmatically.
@@ -2670,8 +2768,48 @@ impl CodeEditor {
     ///
     /// The fold margin is added when folding is enabled, independently of line
     /// numbers, so fold chevrons remain clickable even without line numbers.
+    /// A custom [`GutterLayout`] holds the margin within its own width.
     pub(crate) fn gutter_width(&self) -> f32 {
-        self.line_number_gutter_width() + self.fold_margin_width()
+        let markers = self.fold_margin_width();
+        match self.gutter_layout {
+            Some(layout) if self.line_numbers_enabled => {
+                layout.width.max(markers)
+            }
+            _ => self.line_number_gutter_width() + markers,
+        }
+    }
+
+    /// Returns the x where text starts, before horizontal scrolling.
+    pub(crate) fn text_start_x(&self) -> f32 {
+        let padding =
+            if self.gutter_layout.is_some() { 0.0 } else { TEXT_LEFT_PADDING };
+        self.gutter_width() + padding
+    }
+
+    /// Returns the content-space y of the top of visual line `index`.
+    pub(crate) fn line_top(&self, index: usize) -> f32 {
+        self.padding_top + index as f32 * self.line_height
+    }
+
+    /// Returns the visual line index under content-space `y`, or `None` above
+    /// the first line.
+    pub(crate) fn visual_index_at(&self, y: f32) -> Option<usize> {
+        let offset = y - self.padding_top;
+        (offset >= 0.0).then(|| (offset / self.line_height) as usize)
+    }
+
+    /// Returns the first visual line visible at vertical scroll `scroll`.
+    pub(crate) fn first_visible_index(&self, scroll: f32) -> usize {
+        ((scroll - self.padding_top).max(0.0) / self.line_height).floor()
+            as usize
+    }
+
+    /// Returns the scroll-content height of `visual_lines` lines, padding
+    /// included.
+    pub(crate) fn content_height(&self, visual_lines: usize) -> f32 {
+        self.padding_top
+            + visual_lines as f32 * self.line_height
+            + self.padding_bottom
     }
 
     /// Returns the width of the line-number area (excluding the fold margin).
@@ -2680,9 +2818,29 @@ impl CodeEditor {
     }
 
     /// Returns the width of the fold margin (the chevron column), or `0.0` when
-    /// folding is disabled.
+    /// folding is disabled or its markers are never shown.
     pub(crate) fn fold_margin_width(&self) -> f32 {
-        if self.folding_enabled { FOLD_MARGIN_WIDTH } else { 0.0 }
+        if self.folding_enabled && self.fold_markers != FoldMarkers::Never {
+            FOLD_MARGIN_WIDTH
+        } else {
+            0.0
+        }
+    }
+
+    /// Returns where the line-number and fold-marker columns sit in the gutter.
+    pub(crate) fn gutter_columns(&self) -> GutterColumns {
+        let width = self.gutter_width();
+        let markers = self.fold_margin_width();
+        match self.fold_marker_position {
+            FoldMarkerPosition::BeforeLineNumbers => GutterColumns {
+                line_numbers: markers..width,
+                fold_markers: 0.0..markers,
+            },
+            FoldMarkerPosition::AfterLineNumbers => GutterColumns {
+                line_numbers: 0.0..width - markers,
+                fold_markers: width - markers..width,
+            },
+        }
     }
 
     /// Removes canvas focus from this editor.
@@ -2821,12 +2979,11 @@ impl CodeEditor {
             });
         }
 
-        let gutter = self.gutter_width();
         let max_line_width =
             cache.as_ref().map_or(0.0, MaxContentWidthCache::max_width);
 
-        // gutter + left padding + text + right margin
-        gutter + 5.0 + max_line_width + 20.0
+        // text start + text + right margin
+        self.text_start_x() + max_line_width + 20.0
     }
 
     /// Returns wrapped "visual lines" for the current buffer and layout, with memoization.
@@ -3832,5 +3989,230 @@ mod tests {
         // Collapsed state is preserved but produces no hidden lines while off.
         editor.collapsed_folds.insert(0);
         assert!(editor.hidden_lines_set().is_empty());
+    }
+
+    #[test]
+    fn test_fold_marker_options_default_to_existing_gutter() {
+        let editor = folding_editor();
+        assert_eq!(editor.fold_markers(), FoldMarkers::Always);
+        assert_eq!(
+            editor.fold_marker_position(),
+            FoldMarkerPosition::AfterLineNumbers
+        );
+        assert_eq!(
+            editor.gutter_columns(),
+            GutterColumns {
+                line_numbers: 0.0..GUTTER_WIDTH,
+                fold_markers: GUTTER_WIDTH..GUTTER_WIDTH + FOLD_MARGIN_WIDTH,
+            }
+        );
+    }
+
+    #[test]
+    fn test_fold_marker_position_only_swaps_gutter_columns() {
+        let total = GUTTER_WIDTH + FOLD_MARGIN_WIDTH;
+        let mut editor = folding_editor().with_wrap_enabled(false);
+        editor.horizontal_scroll_offset = editor.char_width() * 2.0;
+        let text_point =
+            iced::Point::new(total + 5.0 + editor.char_width() * 3.0, 5.0);
+        assert_eq!(
+            editor.calculate_cursor_from_point(text_point),
+            Some((0, 5))
+        );
+
+        editor.set_fold_marker_position(FoldMarkerPosition::BeforeLineNumbers);
+        assert_eq!(
+            editor.gutter_columns(),
+            GutterColumns {
+                line_numbers: FOLD_MARGIN_WIDTH..total,
+                fold_markers: 0.0..FOLD_MARGIN_WIDTH,
+            }
+        );
+        assert_eq!(editor.gutter_width(), total);
+        assert_eq!(
+            editor.calculate_cursor_from_point(text_point),
+            Some((0, 5))
+        );
+
+        editor.set_fold_marker_position(FoldMarkerPosition::AfterLineNumbers);
+        assert_eq!(editor.gutter_columns().line_numbers, 0.0..GUTTER_WIDTH);
+        assert_eq!(editor.gutter_columns().fold_markers, GUTTER_WIDTH..total);
+    }
+
+    #[test]
+    fn test_never_fold_markers_free_their_column_and_keep_fold_state() {
+        let mut editor = folding_editor();
+        editor.toggle_fold(2);
+        editor.set_fold_markers(FoldMarkers::Never);
+
+        assert!(editor.gutter_columns().fold_markers.is_empty());
+        assert_eq!(editor.gutter_width(), GUTTER_WIDTH);
+        assert!(editor.is_folded(2));
+
+        let _ = editor.update(&Message::FoldAll);
+        assert!(editor.is_folded(0));
+        let _ = editor.update(&Message::UnfoldAll);
+        assert!(editor.collapsed_folds.is_empty());
+    }
+
+    const MOCKUP_GUTTER: GutterLayout = GutterLayout {
+        width: 52.0,
+        number_size: 12.0,
+        number_right_padding: 16.0,
+    };
+
+    #[test]
+    fn test_gutter_and_padding_defaults_are_unchanged() {
+        let editor = folding_editor();
+        let line_height = editor.line_height;
+        assert_eq!(editor.gutter_layout, None);
+        assert_eq!((editor.padding_top, editor.padding_bottom), (0.0, 0.0));
+        assert_eq!(
+            editor.text_start_x(),
+            GUTTER_WIDTH + FOLD_MARGIN_WIDTH + TEXT_LEFT_PADDING
+        );
+        assert_eq!(editor.line_top(3), 3.0 * line_height);
+        assert_eq!(editor.visual_index_at(2.5 * line_height), Some(2));
+        assert_eq!(editor.first_visible_index(2.5 * line_height), 2);
+        assert_eq!(editor.content_height(6), 6.0 * line_height);
+    }
+
+    #[test]
+    fn test_custom_gutter_layout_holds_fold_markers_within_its_width() {
+        let mut editor = folding_editor();
+        editor.set_gutter_layout(MOCKUP_GUTTER);
+
+        editor.set_fold_marker_position(FoldMarkerPosition::BeforeLineNumbers);
+        assert_eq!(
+            editor.gutter_columns(),
+            GutterColumns {
+                line_numbers: FOLD_MARGIN_WIDTH..52.0,
+                fold_markers: 0.0..FOLD_MARGIN_WIDTH,
+            }
+        );
+        assert_eq!(editor.gutter_width(), 52.0);
+        assert_eq!(editor.text_start_x(), 52.0);
+
+        editor.set_fold_marker_position(FoldMarkerPosition::AfterLineNumbers);
+        assert_eq!(
+            editor.gutter_columns(),
+            GutterColumns {
+                line_numbers: 0.0..52.0 - FOLD_MARGIN_WIDTH,
+                fold_markers: 52.0 - FOLD_MARGIN_WIDTH..52.0,
+            }
+        );
+        assert_eq!(editor.gutter_width(), 52.0);
+
+        editor.set_fold_markers(FoldMarkers::Never);
+        assert_eq!(editor.gutter_columns().line_numbers, 0.0..52.0);
+
+        editor.set_line_numbers_enabled(false);
+        editor.set_fold_markers(FoldMarkers::Always);
+        assert_eq!(editor.gutter_width(), FOLD_MARGIN_WIDTH);
+    }
+
+    #[test]
+    fn test_custom_gutter_layout_drives_text_hit_testing_and_selection() {
+        let mut editor = folding_editor().with_wrap_enabled(false);
+        editor.set_gutter_layout(MOCKUP_GUTTER);
+        let char_width = editor.char_width();
+        let at_col =
+            |col: usize| iced::Point::new(52.0 + char_width * col as f32, 5.0);
+        let (col_1, col_3, col_4) = (at_col(1), at_col(3), at_col(4));
+
+        assert_eq!(editor.calculate_cursor_from_point(col_3), Some((0, 3)));
+        assert_eq!(
+            editor.calculate_cursor_from_point(iced::Point::new(51.0, 5.0)),
+            None
+        );
+
+        editor.horizontal_scroll_offset = char_width * 2.0;
+        assert_eq!(editor.calculate_cursor_from_point(col_3), Some((0, 5)));
+        editor.horizontal_scroll_offset = 0.0;
+
+        let _ = editor.update(&Message::MouseClick(col_1));
+        let _ = editor.update(&Message::MouseRelease);
+        let _ = editor.update(&Message::ShiftClick(col_4));
+        let _ = editor.update(&Message::MouseRelease);
+        assert_eq!(
+            editor.cursors.primary().selection_range(),
+            Some(((0, 1), (0, 4)))
+        );
+    }
+
+    #[test]
+    fn test_content_padding_offsets_lines_and_hit_testing() {
+        let mut editor = folding_editor();
+        editor.set_content_padding(8.0, 8.0);
+        let line_height = editor.line_height;
+
+        assert_eq!(editor.line_top(0), 8.0);
+        assert_eq!(editor.line_top(2), 8.0 + 2.0 * line_height);
+        assert_eq!(editor.content_height(6), 8.0 + 6.0 * line_height + 8.0);
+        assert_eq!(editor.visual_index_at(7.0), None);
+        assert_eq!(editor.visual_index_at(8.0 + 1.5 * line_height), Some(1));
+        assert_eq!(editor.first_visible_index(line_height), 0);
+        assert_eq!(editor.first_visible_index(8.0 + line_height), 1);
+
+        let x = editor.text_start_x() + editor.char_width() * 2.0;
+        assert_eq!(
+            editor.calculate_cursor_from_point(iced::Point::new(x, 4.0)),
+            Some((0, 2)),
+            "the top padding belongs to the first line"
+        );
+        assert_eq!(
+            editor.calculate_cursor_from_point(iced::Point::new(
+                x,
+                8.0 + 1.5 * line_height
+            )),
+            Some((1, 2))
+        );
+        assert_eq!(
+            editor.point_from_position(1, 0).map(|point| point.y),
+            Some(8.0 + line_height)
+        );
+
+        let marker_x = GUTTER_WIDTH + FOLD_MARGIN_WIDTH / 2.0;
+        let marker = |y: f32| iced::Point::new(marker_x, y);
+        assert_eq!(editor.fold_header_at_point(marker(4.0)), None);
+        assert_eq!(
+            editor.fold_header_at_point(marker(8.0 + line_height / 2.0)),
+            Some(0)
+        );
+
+        editor.set_content_padding(-3.0, 2.0);
+        assert_eq!((editor.padding_top, editor.padding_bottom), (0.0, 2.0));
+    }
+
+    #[test]
+    fn test_search_and_goto_line_scroll_with_content_padding() {
+        let content = (0..100)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = CodeEditor::new(&content, "txt");
+        editor.set_content_padding(8.0, 8.0);
+        editor.viewport_height = 200.0;
+        let line_height = editor.line_height;
+
+        editor.search_state.open_search();
+        editor.search_state.set_query("line 50".to_owned(), &editor.buffer);
+        let _ = editor.update(&Message::FindNext);
+        assert_eq!(editor.cursors.primary_position().0, 50);
+        assert_eq!(
+            editor.cursor_scroll_target(),
+            Some(8.0 + 50.0 * line_height + 3.0 * line_height - 200.0)
+        );
+
+        editor.viewport_scroll = 1000.0;
+        let _ = editor.update(&Message::OpenGotoLine);
+        let _ = editor.update(&Message::GotoLineChanged("1".to_string()));
+        let _ = editor.update(&Message::SubmitGotoLine);
+        assert_eq!(editor.cursors.primary_position(), (0, 0));
+        assert_eq!(
+            editor.cursor_scroll_target(),
+            Some(0.0),
+            "scrolling to the first line reveals the top padding"
+        );
     }
 }

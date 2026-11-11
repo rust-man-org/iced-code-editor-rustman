@@ -14,7 +14,7 @@ use super::goto_line_dialog;
 use super::ime_requester::ImeRequester;
 use super::search_dialog;
 use super::wrapping::{self, WrappingCalculator};
-use super::{CodeEditor, GUTTER_WIDTH, Message};
+use super::{CodeEditor, Message};
 use std::rc::Rc;
 
 /// Width of the editor's vertical scrollbar and its thumb, in pixels.
@@ -37,8 +37,7 @@ impl CodeEditor {
         // Reuse memoized visual lines so view layout (canvas height + IME cursor rect)
         // does not trigger repeated wrapping computation.
         let visual_lines = self.visual_lines_cached(self.viewport_width);
-        let total_visual_lines = visual_lines.len();
-        let content_height = total_visual_lines as f32 * self.line_height;
+        let content_height = self.content_height(visual_lines.len());
 
         // Use max of content height and viewport height to ensure the canvas
         // always covers the visible area (prevents visual artifacts when
@@ -261,6 +260,8 @@ impl CodeEditor {
 
     /// Creates the gutter background container if line numbers are enabled.
     ///
+    /// It spans the line numbers, and the fold markers when they come first.
+    ///
     /// # Returns
     ///
     /// Some(container) if line numbers are enabled, None otherwise
@@ -273,7 +274,7 @@ impl CodeEditor {
                 container(
                     Space::new().width(Length::Fill).height(Length::Fill),
                 )
-                .width(Length::Fixed(GUTTER_WIDTH))
+                .width(Length::Fixed(self.gutter_columns().line_numbers.end))
                 .height(Length::Fill)
                 .style(move |_| container::Style {
                     background: Some(Background::Color(gutter_background)),
@@ -385,8 +386,7 @@ impl CodeEditor {
                 .skip(vl.start_col)
                 .take(prefix_len)
                 .collect();
-            let cursor_x = self.gutter_width()
-                + 5.0
+            let cursor_x = self.text_start_x()
                 + super::measure_text_width(
                     &prefix_text,
                     self.full_char_width.get(),
@@ -397,8 +397,7 @@ impl CodeEditor {
             // Calculate visual Y position relative to the viewport
             // We subtract viewport_scroll because the content is scrolled up/down
             // but the cursor position sent to IME must be relative to the visible area
-            let cursor_y = (cursor_visual as f32 * self.line_height)
-                - self.viewport_scroll;
+            let cursor_y = self.line_top(cursor_visual) - self.viewport_scroll;
 
             Rectangle::new(
                 iced::Point::new(cursor_x, cursor_y + 2.0),
@@ -440,8 +439,11 @@ impl CodeEditor {
         // Calculate canvas height and visual lines
         let (visual_lines, canvas_height) = self.calculate_canvas_height();
 
-        // Create scrollable containing the canvas
-        let scrollable = self.create_canvas_with_scrollable(canvas_height);
+        // Create scrollable containing the canvas, with the right-click menu
+        // wrapped directly around it (see `with_context_menu` for why it must
+        // not wrap the whole stack).
+        let scrollable = self
+            .with_context_menu(self.create_canvas_with_scrollable(canvas_height));
 
         // Create background layer with gutter and code backgrounds
         let background_row = self.create_background_layer();
@@ -500,36 +502,6 @@ impl CodeEditor {
             .height(Length::Fill)
             .clip(true);
 
-        // The context menu owns its transient open/close state and positions
-        // itself at the right-click location. The canvas still receives the
-        // right-click event so it can preserve or reposition the selection.
-        let can_undo = self.history.can_undo();
-        let can_redo = self.history.can_redo();
-        let has_selection =
-            self.cursors.iter().any(|cursor| cursor.has_selection());
-        let has_content =
-            self.buffer.line_count() > 1 || self.buffer.line_len(0) > 0;
-        let custom_context_menu_entries =
-            self.custom_context_menu_entries().to_vec();
-        let default_context_menu_enabled = self.default_context_menu_enabled();
-        let reveal_in_file_manager_enabled =
-            self.reveal_in_file_manager_enabled();
-        let translations = self.translations;
-        let editor_container = ContextMenu::new(editor_container, move || {
-            context_menu::view(
-                &custom_context_menu_entries,
-                default_context_menu_enabled,
-                context_menu::MenuState {
-                    can_undo,
-                    can_redo,
-                    has_selection,
-                    has_content,
-                    reveal_in_file_manager_enabled,
-                },
-                translations,
-            )
-        });
-
         // When wrap is disabled, add a horizontal scrollbar below the editor.
         let editor_body: Element<'_, Message> = if self.wrap_enabled {
             editor_container.into()
@@ -558,5 +530,60 @@ impl CodeEditor {
         } else {
             editor_body
         }
+    }
+
+    /// Wraps the canvas scrollable in the right-click context menu.
+    ///
+    /// The menu owns its transient open/close state and positions itself at
+    /// the right-click location. Its widget toggles that state and *captures*
+    /// the right press before forwarding it to its underlay, and it never
+    /// requests a redraw itself — the menu only becomes visible on the next
+    /// frame something else asks for.
+    ///
+    /// It used to wrap the whole editor stack (backgrounds, scrollable, IME
+    /// layer, dialogs). A `Stack` stops delivering an event to lower layers as
+    /// soon as it is captured, and the menu had already captured the press,
+    /// so after the topmost layer (the IME requester) the stack bailed out and
+    /// the canvas never saw the right click: no `ContextMenuRequested` was
+    /// published, the caret/selection handling for context clicks never ran,
+    /// and — with no message and no redraw request — the opened menu did not
+    /// paint until the pointer moved or the caret blinked. That is the "right
+    /// click menu is slow to render" lag.
+    ///
+    /// Wrapping only the scrollable keeps the menu over the same area while
+    /// the press reaches the canvas (scrollables forward to their content
+    /// regardless of capture), whose `ContextMenuRequested` message both runs
+    /// the context-click logic and triggers the redraw that shows the menu.
+    fn with_context_menu<'a>(
+        &self,
+        underlay: impl Into<Element<'a, Message>>,
+    ) -> Element<'a, Message> {
+        let can_undo = self.history.can_undo();
+        let can_redo = self.history.can_redo();
+        let has_selection =
+            self.cursors.iter().any(|cursor| cursor.has_selection());
+        let has_content =
+            self.buffer.line_count() > 1 || self.buffer.line_len(0) > 0;
+        let custom_context_menu_entries =
+            self.custom_context_menu_entries().to_vec();
+        let default_context_menu_enabled = self.default_context_menu_enabled();
+        let reveal_in_file_manager_enabled =
+            self.reveal_in_file_manager_enabled();
+        let translations = self.translations;
+        ContextMenu::new(underlay, move || {
+            context_menu::view(
+                &custom_context_menu_entries,
+                default_context_menu_enabled,
+                context_menu::MenuState {
+                    can_undo,
+                    can_redo,
+                    has_selection,
+                    has_content,
+                    reveal_in_file_manager_enabled,
+                },
+                translations,
+            )
+        })
+        .into()
     }
 }

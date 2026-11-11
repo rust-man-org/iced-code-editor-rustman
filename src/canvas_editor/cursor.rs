@@ -418,7 +418,7 @@ impl CodeEditor {
         }
 
         // Calculate visual line number - point.y is already in canvas coordinates
-        let visual_line_idx = (point.y / self.line_height) as usize;
+        let visual_line_idx = self.visual_index_at(point.y).unwrap_or(0);
 
         // Reuse memoized wrapping result for hit-testing. This avoids recomputing
         // visual lines on every mouse move/drag.
@@ -435,7 +435,7 @@ impl CodeEditor {
 
         // Calculate column within the segment, accounting for horizontal scroll
         let x_in_text =
-            point.x - self.gutter_width() - 5.0 + self.horizontal_scroll_offset;
+            point.x - self.text_start_x() + self.horizontal_scroll_offset;
 
         // Use correct width calculation for CJK support
         let line_content = self.buffer.line(visual_line.logical_line);
@@ -502,22 +502,15 @@ impl CodeEditor {
         count
     }
 
-    /// Returns a scroll command to make the cursor visible.
-    pub(crate) fn scroll_to_cursor(&self) -> Task<Message> {
-        // Reuse memoized wrapping result so repeated scroll computations do not
-        // trigger repeated visual line calculation.
+    /// Returns the vertical scroll offset that brings the primary cursor into
+    /// view, or `None` when it is already visible.
+    pub(crate) fn cursor_scroll_target(&self) -> Option<f32> {
         let visual_lines = self.visual_lines_cached(self.viewport_width);
-
         let pos = self.cursors.primary_position();
-        let cursor_visual =
-            WrappingCalculator::logical_to_visual(&visual_lines, pos.0, pos.1);
-
-        let cursor_y = if let Some(visual_idx) = cursor_visual {
-            visual_idx as f32 * self.line_height
-        } else {
-            // Fallback to logical line if visual not found
-            pos.0 as f32 * self.line_height
-        };
+        let cursor_y =
+            WrappingCalculator::logical_to_visual(&visual_lines, pos.0, pos.1)
+                // Fallback to logical line if visual not found
+                .map_or_else(|| self.line_top(pos.0), |idx| self.line_top(idx));
 
         let viewport_top = self.viewport_scroll;
         let viewport_bottom = self.viewport_scroll + self.viewport_height;
@@ -526,8 +519,7 @@ impl CodeEditor {
         let top_margin = self.line_height * 2.0;
         let bottom_margin = self.line_height * 2.0;
 
-        // Calculate new vertical scroll position if cursor is outside visible area
-        let new_v_scroll = if cursor_y < viewport_top + top_margin {
+        if cursor_y < viewport_top + top_margin {
             // Cursor is above viewport - scroll up
             Some((cursor_y - top_margin).max(0.0))
         } else if cursor_y + self.line_height > viewport_bottom - bottom_margin
@@ -539,16 +531,28 @@ impl CodeEditor {
             )
         } else {
             None
-        };
+        }
+    }
 
-        let vertical_task = if let Some(new_scroll) = new_v_scroll {
-            scroll_to(
-                self.scrollable_id.clone(),
-                scrollable::AbsoluteOffset { x: 0.0, y: new_scroll },
-            )
-        } else {
-            Task::none()
-        };
+    /// Returns a scroll command to make the cursor visible.
+    pub(crate) fn scroll_to_cursor(&self) -> Task<Message> {
+        // Reuse memoized wrapping result so repeated scroll computations do not
+        // trigger repeated visual line calculation.
+        let visual_lines = self.visual_lines_cached(self.viewport_width);
+
+        let pos = self.cursors.primary_position();
+        let cursor_visual =
+            WrappingCalculator::logical_to_visual(&visual_lines, pos.0, pos.1);
+
+        let vertical_task =
+            if let Some(new_scroll) = self.cursor_scroll_target() {
+                scroll_to(
+                    self.scrollable_id.clone(),
+                    scrollable::AbsoluteOffset { x: 0.0, y: new_scroll },
+                )
+            } else {
+                Task::none()
+            };
 
         // Horizontal scroll: only when wrap is disabled
         let h_task = if !self.wrap_enabled {
@@ -561,15 +565,14 @@ impl CodeEditor {
                     .skip(vl.start_col)
                     .take(pos.1.saturating_sub(vl.start_col))
                     .collect();
-                self.gutter_width()
-                    + 5.0
+                self.text_start_x()
                     + measure_text_width(
                         &prefix,
                         self.full_char_width.get(),
                         self.char_width.get(),
                     )
             } else {
-                self.gutter_width() + 5.0
+                self.text_start_x()
             };
 
             let left_boundary = self.gutter_width() + self.char_width.get();
