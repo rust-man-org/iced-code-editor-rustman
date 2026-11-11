@@ -1505,12 +1505,12 @@ impl CodeEditor {
                 .map(|ch| {
                     measure_char_width(
                         ch,
-                        self.full_char_width.get(),
-                        self.char_width.get(),
+                        self.full_char_width(),
+                        self.char_width(),
                     )
                 })
                 .filter(|width| *width > 0.0)
-                .unwrap_or(self.char_width.get())
+                .unwrap_or(self.char_width())
         } else {
             2.0
         };
@@ -2586,8 +2586,8 @@ impl canvas::Program<Message> for CodeEditor {
                     gutter_width: self.gutter_width(),
                     line_height: self.line_height,
                     font_size: self.font_size,
-                    full_char_width: self.full_char_width.get(),
-                    char_width: self.char_width.get(),
+                    full_char_width: self.full_char_width(),
+                    char_width: self.char_width(),
                     font: self.font,
                     horizontal_scroll_offset: self.horizontal_scroll_offset,
                 };
@@ -2651,8 +2651,8 @@ impl canvas::Program<Message> for CodeEditor {
                     gutter_width: self.gutter_width(),
                     line_height: self.line_height,
                     font_size: self.font_size,
-                    full_char_width: self.full_char_width.get(),
-                    char_width: self.char_width.get(),
+                    full_char_width: self.full_char_width(),
+                    char_width: self.char_width(),
                     font: self.font,
                     horizontal_scroll_offset: self.horizontal_scroll_offset,
                 };

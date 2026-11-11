@@ -389,8 +389,8 @@ impl CodeEditor {
             let cursor_x = self.text_start_x()
                 + super::measure_text_width(
                     &prefix_text,
-                    self.full_char_width.get(),
-                    self.char_width.get(),
+                    self.full_char_width(),
+                    self.char_width(),
                 )
                 - self.horizontal_scroll_offset;
 

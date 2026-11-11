@@ -451,8 +451,8 @@ impl CodeEditor {
         {
             let char_width = super::measure_char_width(
                 c,
-                self.full_char_width.get(),
-                self.char_width.get(),
+                self.full_char_width(),
+                self.char_width(),
             );
 
             if current_width + char_width / 2.0 > x_in_text {
@@ -568,15 +568,15 @@ impl CodeEditor {
                 self.text_start_x()
                     + measure_text_width(
                         &prefix,
-                        self.full_char_width.get(),
-                        self.char_width.get(),
+                        self.full_char_width(),
+                        self.char_width(),
                     )
             } else {
                 self.text_start_x()
             };
 
-            let left_boundary = self.gutter_width() + self.char_width.get();
-            let right_boundary = self.viewport_width - self.char_width.get() * 2.0;
+            let left_boundary = self.gutter_width() + self.char_width();
+            let right_boundary = self.viewport_width - self.char_width() * 2.0;
             let cursor_viewport_x =
                 cursor_content_x - self.horizontal_scroll_offset;
 

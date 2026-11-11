@@ -4,9 +4,6 @@
 //! and input directly, bypassing Iced's higher-level widgets for optimal speed.
 
 use iced::Color;
-use iced::advanced::text::{
-    Alignment, Paragraph, Renderer as TextRenderer, Text,
-};
 use iced::widget::operation::{RelativeOffset, snap_to};
 use iced::widget::{Id, canvas};
 use std::cell::{Cell, RefCell};
@@ -25,6 +22,7 @@ use crate::i18n::Translations;
 use crate::text_buffer::TextBuffer;
 use crate::theme::Style;
 use folding::{FoldMarkerPosition, FoldMarkers};
+use font_metrics::CharMetrics;
 pub use history::CommandHistory;
 
 #[cfg(target_arch = "wasm32")]
@@ -44,6 +42,7 @@ mod context_menu;
 mod cursor;
 pub(crate) mod cursor_set;
 pub mod folding;
+mod font_metrics;
 mod goto_line;
 mod goto_line_dialog;
 pub mod history;
@@ -241,6 +240,7 @@ pub mod bench_support {
 /// Canvas-based text editor constants
 pub(crate) const FONT_SIZE: f32 = 14.0;
 pub(crate) const LINE_HEIGHT: f32 = 20.0;
+#[cfg(test)]
 pub(crate) const CHAR_WIDTH: f32 = 8.4; // Monospace character width
 pub(crate) const TAB_WIDTH: usize = 4;
 pub(crate) const GUTTER_WIDTH: f32 = 45.0;
@@ -562,19 +562,15 @@ pub struct CodeEditor {
     pub(crate) ime_preedit: Option<ImePreedit>,
     /// Font size in pixels
     pub(crate) font_size: f32,
-    /// Full character width (wide chars like CJK) in pixels.
+    /// Narrow and wide glyph widths for the current font and size, looked
+    /// up on first use (`None` until then).
     ///
-    /// Held in a `Cell` because it can be re-measured during rendering: the
-    /// initial measurement happens before embedded fonts are loaded, so glyph
-    /// metrics are re-verified on the first frames (see
-    /// [`CodeEditor::ensure_font_metrics`]).
-    pub(crate) full_char_width: Cell<f32>,
+    /// Held in a `Cell` because it is resolved and re-verified during
+    /// rendering: the first measurement can happen before embedded fonts are
+    /// loaded (see [`CodeEditor::ensure_font_metrics`]).
+    pub(crate) char_metrics: Cell<Option<CharMetrics>>,
     /// Line height in pixels
     pub(crate) line_height: f32,
-    /// Character width in pixels.
-    ///
-    /// Held in a `Cell` — see [`CodeEditor::full_char_width`].
-    pub(crate) char_width: Cell<f32>,
     /// Cached render window: the first visual line index included in the cache.
     /// We keep a larger window than the currently visible range to avoid clearing
     /// the canvas cache on every small scroll. Only when scrolling crosses the
@@ -1024,7 +1020,7 @@ impl CodeEditor {
             FOCUSED_EDITOR_ID.store(editor_id, Ordering::Relaxed);
         }
 
-        let mut editor = Self {
+        Self {
             editor_id,
             buffer: TextBuffer::new(content),
             cursors: cursor_set::CursorSet::new((0, 0)),
@@ -1091,9 +1087,8 @@ impl CodeEditor {
             font: iced::Font::MONOSPACE,
             ime_preedit: None,
             font_size: FONT_SIZE,
-            full_char_width: Cell::new(CHAR_WIDTH * 2.0),
+            char_metrics: Cell::new(None),
             line_height: LINE_HEIGHT,
-            char_width: Cell::new(CHAR_WIDTH),
             // Initialize render window tracking for virtual scrolling:
             // these indices define the cached visual line window. The window is
             // expanded beyond the visible range to amortize redraws and keep scrolling smooth.
@@ -1107,12 +1102,7 @@ impl CodeEditor {
             highlight_catch_up_pending: Cell::new(false),
             pre_edit_line: 0,
             pre_edit_last_line: 0,
-        };
-
-        // Perform initial character dimension calculation
-        editor.recalculate_char_dimensions(false);
-
-        editor
+        }
     }
 
     /// Replaces the custom context-menu entries.
@@ -1182,7 +1172,7 @@ impl CodeEditor {
     /// * `font` - The iced font to set for the editor
     pub fn set_font(&mut self, font: iced::Font) {
         self.font = font;
-        self.recalculate_char_dimensions(false);
+        self.reset_char_metrics();
     }
 
     /// Sets the font size and recalculates character dimensions.
@@ -1196,32 +1186,17 @@ impl CodeEditor {
     /// * `auto_adjust_line_height` - Whether to automatically adjust the line height
     pub fn set_font_size(&mut self, size: f32, auto_adjust_line_height: bool) {
         self.font_size = size;
-        self.recalculate_char_dimensions(auto_adjust_line_height);
-    }
-
-    /// Recalculates character dimensions based on current font and size.
-    fn recalculate_char_dimensions(&mut self, auto_adjust_line_height: bool) {
-        self.char_width
-            .set(self.measure_single_char_width("a"));
-        // Use '汉' as a standard reference for CJK (Chinese, Japanese, Korean) wide characters
-        self.full_char_width
-            .set(self.measure_single_char_width("汉"));
-
-        // Fallback for infinite width measurements
-        if self.char_width.get().is_infinite() {
-            self.char_width
-                .set(self.font_size / 2.0); // Rough estimate for monospace
-        }
-
-        if self.full_char_width.get().is_infinite() {
-            self.full_char_width.set(self.font_size);
-        }
-
         if auto_adjust_line_height {
             let line_height_ratio = LINE_HEIGHT / FONT_SIZE;
             self.line_height = self.font_size * line_height_ratio;
         }
+        self.reset_char_metrics();
+    }
 
+    /// Drops the glyph widths, and the layout built from them, so they are
+    /// looked up for the current font and size on next use.
+    fn reset_char_metrics(&mut self) {
+        self.char_metrics.set(None);
         self.content_cache.clear();
         self.overlay_cache.clear();
         *self.max_content_width_cache.borrow_mut() = None;
@@ -1266,33 +1241,19 @@ impl CodeEditor {
         if !young && !revisit {
             return;
         }
-        let measured = self.measure_single_char_width("a");
-        if (measured - self.char_width.get()).abs() > FONT_METRICS_EPSILON {
-            self.char_width.set(measured);
-            self.full_char_width
-                .set(self.measure_single_char_width("汉"));
+        let measured =
+            font_metrics::glyph_width(self.font, self.font_size, "a");
+        if (measured - self.char_width()).abs() > FONT_METRICS_EPSILON {
+            self.char_metrics.set(Some(font_metrics::refresh(
+                self.font,
+                self.font_size,
+                measured,
+            )));
             self.font_metrics_updated.set(true);
             self.content_cache.clear();
             self.overlay_cache.clear();
             *self.max_content_width_cache.borrow_mut() = None;
         }
-    }
-
-    /// Measures the width of a single character string using the current font settings.
-    fn measure_single_char_width(&self, content: &str) -> f32 {
-        let text = Text {
-            content,
-            font: self.font,
-            size: iced::Pixels(self.font_size),
-            line_height: iced::advanced::text::LineHeight::default(),
-            bounds: iced::Size::new(f32::INFINITY, f32::INFINITY),
-            align_x: Alignment::Left,
-            align_y: iced::alignment::Vertical::Top,
-            shaping: iced::advanced::text::Shaping::Advanced,
-            wrapping: iced::advanced::text::Wrapping::default(),
-        };
-        let p = <iced::Renderer as TextRenderer>::Paragraph::with_text(text);
-        p.min_width()
     }
 
     /// Returns the current font size.
@@ -1310,7 +1271,7 @@ impl CodeEditor {
     ///
     /// The character width in pixels
     pub fn char_width(&self) -> f32 {
-        self.char_width.get()
+        self.char_metrics().char_width
     }
 
     /// Returns the width of a wide character (e.g. CJK) in pixels.
@@ -1319,12 +1280,23 @@ impl CodeEditor {
     ///
     /// The full character width in pixels
     pub fn full_char_width(&self) -> f32 {
-        self.full_char_width.get()
+        self.char_metrics().full_char_width
+    }
+
+    /// Returns the glyph widths for the current font and size, looking them
+    /// up in the process-wide cache on first use.
+    pub(crate) fn char_metrics(&self) -> CharMetrics {
+        if let Some(metrics) = self.char_metrics.get() {
+            return metrics;
+        }
+        let metrics = font_metrics::cached(self.font, self.font_size);
+        self.char_metrics.set(Some(metrics));
+        metrics
     }
 
     /// Measures the rendered width for a given text snippet using editor metrics.
     pub fn measure_text_width(&self, text: &str) -> f32 {
-        measure_text_width(text, self.full_char_width.get(), self.char_width.get())
+        measure_text_width(text, self.full_char_width(), self.char_width())
     }
 
     /// Sets the line height used by the editor
@@ -1856,8 +1828,8 @@ impl CodeEditor {
         let x = self.text_start_x()
             + measure_text_width(
                 &prefix_text,
-                self.full_char_width.get(),
-                self.char_width.get(),
+                self.full_char_width(),
+                self.char_width(),
             );
         Some(iced::Point::new(x, self.line_top(visual_index)))
     }
@@ -2963,8 +2935,8 @@ impl CodeEditor {
                 .map(|line| {
                     measure_text_width(
                         self.buffer.line(line),
-                        self.full_char_width.get(),
-                        self.char_width.get(),
+                        self.full_char_width(),
+                        self.char_width(),
                     )
                 })
                 .collect();
@@ -3024,8 +2996,8 @@ impl CodeEditor {
             wrap_column: self.wrap_column,
             folding_enabled: self.folding_enabled,
             fold_revision: self.fold_revision,
-            full_char_width_bits: self.full_char_width.get().to_bits(),
-            char_width_bits: self.char_width.get().to_bits(),
+            full_char_width_bits: self.full_char_width().to_bits(),
+            char_width_bits: self.char_width().to_bits(),
         };
 
         let mut cache = self.visual_lines_cache.borrow_mut();
@@ -3039,8 +3011,8 @@ impl CodeEditor {
         let wrapping_calc = wrapping::WrappingCalculator::new(
             self.wrap_enabled,
             self.wrap_column,
-            self.full_char_width.get(),
-            self.char_width.get(),
+            self.full_char_width(),
+            self.char_width(),
         );
         let visual_lines = wrapping_calc.calculate_visual_lines(
             &self.buffer,
@@ -3086,8 +3058,9 @@ impl CodeEditor {
             && cache.key.wrap_column == self.wrap_column
             && cache.key.folding_enabled == self.folding_enabled
             && cache.key.fold_revision == self.fold_revision
-            && cache.key.full_char_width_bits == self.full_char_width.get().to_bits()
-            && cache.key.char_width_bits == self.char_width.get().to_bits();
+            && cache.key.full_char_width_bits
+                == self.full_char_width().to_bits()
+            && cache.key.char_width_bits == self.char_width().to_bits();
         if !same_layout {
             *cache_guard = None;
             return;
@@ -3120,8 +3093,8 @@ impl CodeEditor {
         let wrapping_calc = wrapping::WrappingCalculator::new(
             self.wrap_enabled,
             self.wrap_column,
-            self.full_char_width.get(),
-            self.char_width.get(),
+            self.full_char_width(),
+            self.char_width(),
         );
         let changed_visual_lines = wrapping_calc.calculate_visual_lines_range(
             &self.buffer,
@@ -3205,8 +3178,8 @@ impl CodeEditor {
             .map(|line| {
                 measure_text_width(
                     self.buffer.line(line),
-                    self.full_char_width.get(),
-                    self.char_width.get(),
+                    self.full_char_width(),
+                    self.char_width(),
                 )
             })
             .collect();
@@ -3589,15 +3562,17 @@ mod tests {
     }
 
     #[test]
-    fn test_measure_single_char_width() {
+    fn test_glyph_width_of_reference_chars() {
         let editor = CodeEditor::new("", "rs");
 
         // Measure 'a'
-        let width_a = editor.measure_single_char_width("a");
+        let width_a =
+            font_metrics::glyph_width(editor.font, editor.font_size, "a");
         assert!(width_a > 0.0, "Width of 'a' should be positive");
 
         // Measure Chinese char
-        let width_cjk = editor.measure_single_char_width("汉");
+        let width_cjk =
+            font_metrics::glyph_width(editor.font, editor.font_size, "汉");
         assert!(width_cjk > 0.0, "Width of '汉' should be positive");
 
         // On a machine with no CJK font installed, '汉' falls back to a
@@ -3629,12 +3604,14 @@ mod tests {
         let editor = CodeEditor::new("", "rs");
 
         // The real measurement for the editor's font:
-        let real = editor.measure_single_char_width("a");
+        let real =
+            font_metrics::glyph_width(editor.font, editor.font_size, "a");
 
         // Simulate the boot race: the width was captured before the real font
         // was registered, so it is wrong by more than the epsilon.
-        let stale = real + 2.0;
-        editor.char_width.set(stale);
+        let stale =
+            CharMetrics { char_width: real + 2.0, ..editor.char_metrics() };
+        editor.char_metrics.set(Some(stale));
 
         // A stale measurement must be corrected by the self-heal check.
         editor.ensure_font_metrics();
@@ -3647,10 +3624,10 @@ mod tests {
 
         // Once corrected, the check is disabled for good.
         editor.font_metrics_updated.set(true);
-        editor.char_width.set(stale);
+        editor.char_metrics.set(Some(stale));
         editor.ensure_font_metrics();
         assert!(
-            (editor.char_width() - stale).abs() < f32::EPSILON,
+            (editor.char_width() - stale.char_width).abs() < f32::EPSILON,
             "no further re-measurement after the metrics settled"
         );
     }
